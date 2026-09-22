@@ -288,14 +288,14 @@ class DataSet:
 
     def import_all(self,
                    scans=None, shape=None,
-                   guess_y0=True
+                   guess_y0=True, master_motors=None
                   ):
         # collect the data
         self.import_scans(scans=scans)
         # lima frames
         self.import_imagefiles()
         # motor positions
-        self.import_motors_from_master()
+        self.import_motors_from_master(master_motors=master_motors)
         self.guess_shape()
         self.guessbins()
         if guess_y0:
@@ -419,7 +419,7 @@ class DataSet:
         ]
         logging.info("imported %d lima filenames" % (np.sum(self.frames_per_file)))
 
-    def import_motors_from_master(self):
+    def import_motors_from_master(self, master_motors=None):
         """read the motors from the lima file
         you need to import the imagefiles first
         these will be the motor positions to accompany the images
@@ -432,7 +432,8 @@ class DataSet:
         self.dty = [
             None,
         ] * len(self.scans)
-        with h5py.File(self.masterfile, "r") as hin:
+        master = self.masterfile if master_motors is None else master_motors
+        with h5py.File(master, "r") as hin:
             bad = []
             for i, scan in enumerate(self.scans):
                 # Should always be there, if not, filter scans before you get to here
