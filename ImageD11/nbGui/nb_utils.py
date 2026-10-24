@@ -802,6 +802,189 @@ def plot_grain_sinograms(grains, cf, n_grains_to_plot=None):
     plt.show()
 
 
+def plot_grainsino_grid(grainsinos, n_grains_to_plot=None):
+    """Plot built sinograms, including fractional peak refinements, in one grid."""
+    if not grainsinos:
+        return None
+    count = len(grainsinos) if n_grains_to_plot is None else min(
+        len(grainsinos), int(n_grains_to_plot)
+    )
+    if count < 1:
+        raise ValueError("n_grains_to_plot must be positive")
+    indices = np.linspace(0, len(grainsinos) - 1, count, dtype=int)
+    ncols = int(np.ceil(np.sqrt(count)))
+    nrows = int(np.ceil(count / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 2.5 * nrows),
+                             squeeze=False, sharex=True, sharey=True,
+                             constrained_layout=True)
+    for ax, index in zip(axes.ravel(), indices):
+        gs = grainsinos[index]
+        ax.pcolormesh(gs.sinoangles, gs.ds.ybincens, gs.ssino, shading="auto")
+        ax.set_title("Grain {}{}".format(
+            getattr(gs.grain, "gid", index),
+            " ({})".format(getattr(gs, "peak_assignment_kind", None) or "split")
+            if gs.source_2d_rows is not None else "",
+        ))
+    for ax in axes.ravel()[count:]:
+        ax.set_visible(False)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("omega (degrees)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("dty")
+    return fig
+
+
+def report_sinogram_refinement(result, max_grains=4, plot=True):
+    """Print measured refinement diagnostics and return report figures.
+
+    The overview covers all grains. Detailed views sample at most max_grains;
+    assignment scatter plots sample at most 10000 candidate rows per grain.
+    Statistics use the full result, regardless of plotting limits. plot=False
+    prints the report without creating figures. No files or results are changed.
+    """
+    if (isinstance(max_grains, (bool, np.bool_))
+            or not isinstance(max_grains, (int, np.integer)) or max_grains < 0):
+        raise ValueError("max_grains must be a nonnegative integer")
+    stats = result.stats
+    history = result.history
+    status = ("initialization only" if not history else
+              "converged" if result.converged else "not converged")
+    print("Sinogram refinement: {} ({} iterations)".format(status, len(history)))
+    for name in ("elapsed_seconds", "input_candidates", "filtered", "candidates",
+                 "seeded", "retained", "rejected", "exclusive", "shared",
+                 "added", "removed", "reassigned", "assigned_intensity",
+                 "available_intensity", "retained_intensity",
+                 "retained_available_intensity", "weight_change", "maximum_change",
+                 "calibrated_relative_residual"):
+        value = stats.get(name)
+        if value is not None:
+            print("  {}: {}".format(name, value))
+    print("  Shared peaks count once in retained, once per contributing grain in counts.")
+    print("  Retained intensity fractions use all candidate / available intensity, respectively.")
+    ids = list(result.child_ids) if result.child_ids else list(range(len(result.grainsinos)))
+    print("  grain | initial peaks | final peaks | assigned intensity | projections | mask pixels")
+    for k, gid in enumerate(ids):
+        values = [stats[name][k] if name in stats else None for name in
+                  ("initial_counts", "counts", "grain_intensities", "projections", "mask_pixels")]
+        print("  {} | {} | {} | {} | {} | {}".format(gid, *values))
+    if not plot:
+        return []
+    figures = []
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8), constrained_layout=True)
+    fig.suptitle("Sinogram refinement: {}".format(status))
+    x = np.arange(len(ids))
+    ticks = np.linspace(0, len(ids) - 1, min(20, len(ids)), dtype=int)
+    tick_labels = [ids[k] for k in ticks]
+    ax = axes[0, 0]
+    for name, offset, label in (("initial_counts", -.2, "Initial"), ("counts", .2, "Final")):
+        if name in stats:
+            ax.bar(x + offset, stats[name], width=.4, label=label)
+    ax.set(xticks=ticks, xticklabels=tick_labels, xlabel="Grain ID", ylabel="Contributing 2D peaks")
+    if ax.containers:
+        ax.legend()
+    ax = axes[0, 1]
+    if "grain_intensities" in stats:
+        ax.bar(x, stats["grain_intensities"])
+    ax.set(xticks=ticks, xticklabels=tick_labels, xlabel="Grain ID", ylabel="Assigned intensity")
+    panels = (
+        (axes[0, 2], ("weight_change", "maximum_change"), "Intensity fraction change"),
+        (axes[1, 0], ("retained_available_intensity",), "Fraction of available intensity"),
+        (axes[1, 1], ("added", "removed", "reassigned"), "Changes since previous iteration"),
+        (axes[1, 2], ("calibrated_relative_residual",), "Calibrated relative residual"),
+    )
+    for ax, names, ylabel in panels:
+        for name in names:
+            valid = [h for h in history if h.get(name) is not None]
+            if valid:
+                ax.plot([h["iteration"] for h in valid], [h[name] for h in valid], "o-", label=name.replace("_", " "))
+        ax.set(xlabel="Iteration", ylabel=ylabel)
+        if ax.lines:
+            ax.legend()
+        else:
+            ax.text(.5, .5, "No iteration measurements", ha="center", transform=ax.transAxes)
+    figures.append(fig)
+    count = min(max_grains, len(result.grainsinos))
+    indices = np.linspace(0, len(result.grainsinos) - 1, count, dtype=int) if count else []
+    stride = max(1, (len(result.source_2d_rows) + 9999) // 10000)
+    rows = result.source_2d_rows[::stride]
+    for k in indices:
+        gs = result.grainsinos[k]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4), constrained_layout=True)
+        fig.suptitle("Grain {}: refined sinogram and assignments".format(ids[k]))
+        axes[0].pcolormesh(gs.sinoangles, gs.ds.ybincens, gs.ssino, shading="auto")
+        axes[0].set(xlabel="Projection angle (degrees)", ylabel="dty", title="Final sinogram")
+        axes[1].imshow(gs.recons["iradon"], origin="lower", vmin=0)
+        mask = gs.spatial_split_mask
+        if mask is not None and np.any(mask) and not np.all(mask):
+            axes[1].contour(mask, levels=[.5], colors=["red"])
+        axes[1].set(title="Reconstruction and spatial support", xlabel="Sample Y pixel", ylabel="Sample X pixel")
+        fractions = result.peak_weights[::stride, k]
+        omega = np.mod(gs.ds.pk2d["omega"][rows], 360)
+        dty = gs.ds.pk2d["dty"][rows]
+        axes[2].scatter(omega[fractions == 0], dty[fractions == 0], s=2, color=".8")
+        used = fractions > 0
+        points = axes[2].scatter(omega[used], dty[used], c=fractions[used],
+                                 s=3, cmap="viridis", vmin=0, vmax=1)
+        fig.colorbar(points, ax=axes[2], label="Assigned intensity fraction")
+        axes[2].set(xlabel="omega modulo 360 (degrees)", ylabel="dty",
+                    title="Assignments ({} of {} candidate rows)".format(len(rows), len(result.source_2d_rows)))
+        figures.append(fig)
+    return figures
+
+
+def plot_decoupled_sinograms(results):
+    """Plot full fractional sinograms, spatial supports, and convergence."""
+    figures = []
+    for result in results:
+        fig, axes = plt.subplots(len(result.grainsinos), 4,
+                                 figsize=(18, 4 * len(result.grainsinos)), squeeze=False)
+        for k, gs in enumerate(result.grainsinos):
+            axes[k, 0].pcolormesh(
+                gs.sinoangles, gs.ds.ybincens, gs.ssino, shading="auto"
+            )
+            axes[k, 0].set(
+                title="Grain {}: split sinogram".format(
+                    result.child_ids[k] if result.child_ids else k
+                ),
+                xlabel="omega (degrees)",
+                ylabel="dty",
+            )
+            axes[k, 1].imshow(gs.recons["iradon"], origin="lower", vmin=0)
+            axes[k, 1].contour(gs.spatial_split_mask, levels=[0.5], colors=["red"])
+            axes[k, 1].set_title("Reconstruction and spatial support")
+            rows = result.source_2d_rows
+            used = result.peak_weights[:, k] > 0
+            axes[k, 2].scatter(
+                gs.ds.pk2d["omega"][rows[~used]],
+                gs.ds.pk2d["dty"][rows[~used]],
+                s=2,
+                color="0.8",
+            )
+            points = axes[k, 2].scatter(
+                gs.ds.pk2d["omega"][rows[used]],
+                gs.ds.pk2d["dty"][rows[used]],
+                s=3,
+                c=result.peak_weights[used, k],
+                cmap="viridis",
+                vmin=0,
+                vmax=1,
+            )
+            fig.colorbar(points, ax=axes[k, 2], label="Intensity fraction")
+            axes[k, 2].set(
+                title="Exclusive and shared contributions", xlabel="omega", ylabel="dty"
+            )
+            history = result.history
+            if history:
+                key = "weight_change" if k == 0 else "retained_intensity"
+                axes[k, 3].plot(
+                    [h["iteration"] for h in history], [h[key] for h in history], "o-"
+                )
+                axes[k, 3].set(xlabel="iteration", ylabel=key.replace("_", " "))
+        fig.tight_layout()
+        figures.append(fig)
+    return figures
+
+
 def get_rgbs_for_grains(grains):
     # get the U matrices for each grain
     Us = np.array([g.U for g in grains])
