@@ -156,35 +156,87 @@ print(refinement.stats)
 print(refinement.history[-1] if refinement.history else "Initialization only")
 ```
 
+### Spatial threshold decoupling (default manual workflow)
+
+Set `grain_ids_to_decouple = {parent_id: expected_count}` with the actual parent
+IDs. A list requests two components per selected parent. The indexing notebook
+starts with an empty list, and `decoupling_options["initialization"] = "spatial"`.
+Direct `split_grain_sinogram` calls use this same spatial mode by default.
+
+The confirmed workflow is reconstruction-first:
+
+1. Reconstruct all compatible parent peaks into one image.
+2. Smooth positive density with the same one-pixel Gaussian used by feedback.
+3. Threshold at `mask_level` times the image maximum and label disconnected blobs.
+4. Fill holes and apply the existing `dilation` to each blob; determine its centre
+   and enclosing radius from image coordinates, not from a sinusoid fit.
+5. Forward-project each mask onto measured peak positions to initialize conserved
+   fractional assignments, then run the existing back/forward projection loop.
+
+Supply a calibrated `y0`, or store it as `ds.y0`. Spatial mode does not estimate
+the rotation axis by fitting peak trajectories and does not assume zero when it
+is missing. `mask_level`, `dilation`, `support_level` and `roi_radius` control the
+spatial supports. Sinusoid width, angular support, trial count and random seeds
+are not used by this initialization path. Known twin pairs retain their separate
+exclusive-reflection initialization.
+
+With `spatial_keep_largest=True` (the selected default), extra thresholded regions
+are ranked by pixel area and the expected number of largest regions are retained
+as spatial seeds. Every excluded region is reported. Set the option to `False`
+for strict count matching. Fewer regions than expected always raises; touching
+regions are not forcibly subdivided. Initial `labels4d`
+are -1 because assignments are made at the underlying 2D peak level. Results mark
+`stats["initialization"] = "spatial_threshold"`. Exported fractional provenance
+and the mapping notebook's saved-assignment reader are unchanged.
+
+The exact older source was not recoverable from the commit, stash or dangling
+Git objects. This reconstructs the user-confirmed thresholded-blob workflow;
+it is not a claim of byte-for-byte recovery. Tests exercise actual iradon and
+forward-projection kernels on synthetic blobs and check centre recovery, peak
+selection and intensity conservation. Real-scan reconstruction quality remains
+unverified without the scan and its former settings.
+
+The previous RANSAC-based mode remains explicitly available with
+`initialization="trajectory"`. Its fixed-count legacy initializer and scalar/PCG64
+regression fixtures are retained for comparison, but it is not the default spatial
+workflow. Automatic sinusoid-count screening also requires this explicit mode.
+
 ### Automatic spatial component counts
 
-Use `grain_ids_to_decouple = [0, 2]` in the indexing notebook. Each selected
-parent's number of spatial trajectories is estimated automatically, up to
-`decoupling_options["max_components"]` (default 8). Only selected parents are
+Set `decoupling_options["initialization"] = "trajectory"` and use
+`grain_ids_to_decouple = {0: None, 2: None}` to opt selected parents into
+automatic sinusoid-count estimation, up to
+`decoupling_options["max_components"]` (default 4; larger requested limits are capped at four). Only selected parents are
 examined. A single detected trajectory retains one child and appends no grains.
 Child 0 keeps the parent ID; additional children are appended.
 
 Candidate counts are fitted with a common rotation-axis offset, using the
 existing centreline width and margin. Three validation folds hold out entire
-30-degree angular sectors, keeping repeated turns together. Each track needs
-at least eight training peaks spanning three 15-degree sectors. Scores average
-capped squared prediction errors across occupied angular sectors and add a
-parameter-count penalty. The smallest count within one standard error of the
-best score is selected. The search stops at the first unsupported count.
-At least four occupied 30-degree sectors are required.
+30-degree angular sectors, keeping repeated turns together. Each track must occupy at least twelve 15-degree sectors (180 degrees of
+angular support) in the full data. Training folds retain two thirds of the
+angular sectors and require eight occupied sectors (120 degrees) per track. Selection scores average normalized Gaussian-mixture negative log likelihoods
+across occupied angular sectors and add a parameter-count penalty. Branch widths
+and mixture weights are estimated only from training data. The smallest count
+within one standard error of the best selection score is selected. The search stops at the first unsupported count.
+At least twelve occupied 15-degree sectors are required. Partial residual
+tracks are rejected during RANSAC scoring and before nonlinear refinement.
 
-`result.stats["component_selection"]` reports candidate counts, scores, the
-selected count, ambiguity within that score tolerance, and whether the selected
-count reached the search limit. These are model diagnostics, not calibrated
-probabilities. Increase `max_components` if the selected count reaches it.
+`result.stats["component_selection"]` reports candidate counts, the selected
+count, ambiguity and whether a computational search limit was reached.
+`selection_scores` and `selection_standard_error` are the likelihood-based values
+used for selection; lower scores are better. `selection_method` identifies the
+metric. The original `scores` and `standard_error` fields retain the legacy
+capped-distance diagnostics for comparison. These are model diagnostics, not calibrated
+probabilities. A selected count of four is valid because four is the known physical maximum.
+A search limit below four can still leave the result unresolved.
 Inspect reconstructed spatial masks before export. Nearby tracks, broad grains,
 weak branches, limited angles or a poorly chosen centreline width can make the
 count uncertain; estimating trajectories does not establish physical grain identity.
 
-`decouple_grain_sinograms(grain_ids=[0, 2])` uses the same automatic selection.
-A direct `split_grain_sinogram` call defaults to `n_components=None` for automatic
-counting. Explicit mappings such as `{0: 3, 2: 4}` and direct integer
-`n_components` values remain available as overrides (at least two).
+`decouple_grain_sinograms(grain_ids={0: None, 2: None})` uses automatic selection.
+A direct `split_grain_sinogram(..., initialization="trajectory", n_components=None)`
+opts into automatic counting; the default is a spatial two-blob split. Explicit mappings such as `{0: 3, 2: 4}` and direct integer
+`n_components` values remain available as overrides (two to four).
 Known twin pairs retain exactly two distinct orientations. Spatial components
 of one parent inherit its UBI and share the existing conserved-intensity
 refinement loop. Detection operates on eligible merged 4D peaks before loading
@@ -193,28 +245,30 @@ that parent's 2D contributions; candidate residual arrays cost approximately
 
 ### Batch screening of all grains
 
-The indexing notebook defaults to `grain_ids_to_decouple = None`. This screens
+Opt into sinusoid-based batch estimation with `grain_ids_to_decouple = None`
+and `decoupling_options["initialization"] = "trajectory"`. This screens
 every original parent, excluding members of explicit known twin pairs. Only a
-supported, unambiguous count above one and below `max_components` triggers 2D
-preparation and reconstruction. The validated detection fit is reused.
+supported, unambiguous count above one within the four-track maximum triggers 2D
+preparation and reconstruction. The detected count is passed to the original manual spatial initializer.
 Single-track parents retain their original grain objects and peak assignments.
 Children are appended only for successful decouplings, preserving parent IDs.
 
 ```python
 report = []
+trajectory_parameters = dict(decoupling_parameters, initialization="trajectory")
 grains, results, cf_strong_decoupled = decouple_grain_sinograms(
     ds, grains_before_decoupling, cf_4d,
     grain_ids=None,
     twin_pairs=twin_pairs_to_decouple,
     cf_strong=cf_strong_before_decoupling,
     report=report,
-    **decoupling_parameters,
+    **trajectory_parameters,
 )
 ```
 
 `report` receives dictionaries with `parent_ids`, `child_ids`, `n_components`,
 `status`, `component_selection` and `error`. Status is `split`, `unchanged`,
-`review` or `failed`. Ambiguous counts and counts at the search limit need
+`review` or `failed`. Ambiguous counts and counts at a search limit below four need
 `review`; failed screening/reconstruction records the error. Both retain the
 original parents, and processing continues. Global input and intensity-
 conservation errors still stop processing. Known twin pairs retain their two
@@ -267,3 +321,156 @@ figures = utils.report_sinogram_refinement(refinement, max_grains=4)
 for index, figure in enumerate(figures):
     figure.savefig("refinement_report_{}.png".format(index), dpi=160)
 ```
+
+### Screening performance
+
+The timings below describe the batching optimization before the subsequent
+four-track/180-degree screening constraints. They are historical comparisons,
+not timings measured with those new constraints.
+
+RANSAC screening batches the tiny, well-conditioned sample-system solves and
+reuses angular groups when scoring trials. It keeps the sample order, RNG stream,
+trial count, angular validation folds, support checks and selection penalties.
+Scoring stops only when the existing score's mathematical upper bound has been
+reached; all random samples have already been drawn. Direct solves replace least
+squares for these square systems, so roundoff can differ slightly. The final
+robust trajectory refinement is unchanged. No notebook settings need changing.
+
+Complete automatic trajectory-count selection, with 600 RANSAC trials and a
+search limit of six components, measured the following median times over three
+repeated calls in one Python process. These are synthetic irregular-angle scans
+with 1200 observations per track, Gaussian dty noise of sigma 0.08, fitting width
+0.5 and margin 0.2. Python 3.12, NumPy 1.26.4 and SciPy 1.11.4 were used with
+one BLAS thread; global HKL selection, 2D peak loading and reconstruction are
+excluded.
+
+| True tracks | Observations | Previous screening | Batched screening | Speedup |
+| --- | --- | --- | --- | --- |
+| 1 | 1200 | 1.929 s | 0.589 s | 3.27x |
+| 2 | 2400 | 5.571 s | 2.703 s | 2.06x |
+| 4 | 4800 | 20.295 s | 14.915 s | 1.36x |
+
+These cases retained identical selected counts, peak labels, ambiguity and limit
+flags. Centres matched within rtol/atol 1e-8, and candidate scores within
+rtol 1e-7 / atol 1e-9. Real-scan timing has not been measured. The benefit depends
+on track count, peak count and how much time the final nonlinear fits consume.
+
+Each temporary float scoring matrix is bounded to approximately 1 MiB, or one
+observation vector when that is larger. Angular sector/order arrays add roughly
+16 bytes per eligible merged 4D observation during one RANSAC fit. No arrays are
+added per global 2D peak. The code does not construct an observations-by-all-trials
+matrix.
+
+Screening now tests at most four tracks, using the user's minimum of 180 degrees
+of support per track, measured by occupied 15-degree sectors modulo 360. This
+counts angular support rather than the linear max-minus-min angle, so repeated
+turns and the zero-degree boundary are handled consistently. It does not impose
+an intensity cutoff: a weak track may still count if its angular support qualifies.
+The existing trials, validation folds and width/margin tolerances are retained;
+short residual fragments are rejected before nonlinear fits. Explicit component
+counts are restricted to two through four. Notebook defaults now use four, and
+older settings above four are capped during automatic screening.
+
+### Candidate-only HKL scoring and adaptive RANSAC
+
+Ownership masking now precedes HKL scoring. Each parent scores only its owned
+and unassigned candidate rows; known twin pairs score their union. Original
+4D row indices/order and the compatibility matrix layout are preserved. A full
+mask uses the original direct path to avoid unnecessary column copies. Only
+candidate g-vector columns are gathered; no new arrays are added per global 2D
+peak. The existing full-length boolean compatibility matrix remains available
+for indexed access by the downstream twin initializer.
+
+For optional adaptive count searches, set
+`decoupling_options["ransac_confidence"] = 0.999`. The notebook defaults to `None`.
+RANSAC draws batches of at most 32 samples and uses the best supported model's
+inlier count to update its trial limit. For a minimal sample of size s, the
+all-inlier sampling probability is the product of (I-j)/(N-j), j=0..s-1, because
+sampling is without replacement. The nominal required trial count is
+ceil(log(1-confidence)/log(1-probability)). `trials=600` remains the hard cap;
+a low inlier fraction can prevent reaching the target. Well-conditioned sample
+checks, 180-degree track support, robust refinement and angular validation remain
+in place.
+
+This is a nominal RANSAC sampling target, not a calibrated probability that the
+selected grain count is correct; conditioning and model mismatch affect it.
+Adaptive stopping consumes fewer random draws, so later hypotheses and fitted
+values may differ from fixed-trial mode. `ransac_confidence=None` disables
+adaptive stopping and retains the fixed-trial sampling stream. Increasing the
+confidence generally requires more samples, up to the existing hard cap.
+
+Repeated synthetic benchmarks (median of three calls, one BLAS thread,
+Python 3.12 / NumPy 1.26.4 / SciPy 1.11.4) measured:
+
+| Workload | Previous | Optimized | Speedup |
+| --- | --- | --- | --- |
+| HKL eligibility, 500000 4D rows / 20 parents, masks included | 0.275 s | 0.047 s | 5.84x |
+| Automatic counting, one track / 600 observations | 0.380 s | 0.081 s | 4.69x |
+| Automatic counting, two tracks / 1200 observations | 1.342 s | 0.311 s | 4.32x |
+| Automatic counting, four tracks / 2400 observations | 5.504 s | 2.703 s | 2.04x |
+
+Counting used irregular full-turn angles, sigma 0.08 dty noise, width 0.5,
+margin 0.2, a four-track maximum and a 600-trial cap; optimized counting used
+confidence 0.999. Both paths selected the expected counts, with fitted centres
+within 0.04 dty units of the synthetic centres. Eligibility returned identical
+selected rows. Counting timings exclude eligibility, 2D preparation and
+reconstruction; the separate speedup factors should not be multiplied.
+Real-scan timing and real-scan detection differences remain unmeasured.
+
+### Preventing broad branches from being counted twice
+
+The former nearest-trajectory distance score could keep improving when extra
+sinusoids divided the width of a broad branch. This reproduced four selected
+components in synthetic signals containing only two Gaussian-broadened tracks,
+with sigma 0.3, 0.5 and 0.8 against a fitting width of 0.5.
+
+Selection now scores a normalized mixture of track densities on held-out angular
+sectors. Each track has a training-estimated RMS width and frequency weight;
+width is bounded below by the existing robust-fit scale, `width / 2`. Mixture
+weights sum to one, so adding curves no longer provides free density. The
+penalty counts two position coordinates, one width and the mixture weights,
+plus the shared offset when fitted. The per-observation penalty is
+`0.5 * parameter_count * log(n) / n`, with `parameter_count = 4*k - 1` plus
+one for a fitted offset. The existing one-standard-error rule prefers a smaller
+count with comparable predictive quality.
+
+The reproduced two-track signals now select two. Broad one-, three- and
+four-track regression signals retain their respective counts, as do unequal-
+strength and background-contaminated cases. These checks are synthetic; the
+Gaussian profile approximation and count selection still need validation on
+real scan data. The old distance scores are retained separately in diagnostics
+and can continue to favour four; inspect `selection_scores` for the actual choice.
+
+Screening may still test up to four candidates. Scores are not necessarily
+monotonic: a genuine three-track mixture can score worse at two tracks before
+improving sharply at three. Consequently a first-failed-improvement stopping
+rule is not applied. The maximum remains a search ceiling, not a requested count.
+Earlier timing tables predate this selection-metric change.
+
+### Extra threshold regions and exclusion reporting
+
+For manual counts, `spatial_keep_largest=True` keeps the requested number of
+largest connected regions by pixel area. This policy was explicitly selected for
+the case where parent 5 produced 28 regions with two grains expected. Ties use
+region ID; children retain the existing physical-centre ordering. Region areas
+are measured before hole filling and dilation. This does not classify every
+excluded region as noise: the diagnostic report exposes the selection for review.
+Original peak tables are unchanged; only the initial spatial supports are selected.
+
+`result.stats["spatial_components"]` contains the found/expected counts, retained
+and excluded region IDs, every region's pixel area and integrated smoothed
+reconstruction density, and the total excluded area/density. Reconstructed density
+is an image diagnostic, not measured diffraction peak intensity. The initial image
+and region labels are available in `result.spatial_component_diagnostics`; they
+remain in memory and are not added to the HDF5 export schema.
+
+`report_sinogram_refinement` now prints the region table and displays the initial
+smoothed reconstruction, retained-region outlines and a ranked region-area chart.
+It respects the existing `plot_refinement_report` and preview limits. These images
+cost one reconstruction-sized float image and one integer label image per split,
+not arrays indexed by every global 2D peak. The text report still covers all regions
+when plotting is disabled.
+
+The iteration-limit warning is independent of component-count selection. Results
+retain `converged=False` and their iteration diagnostics when the limit is reached;
+this change does not suppress that warning or alter convergence thresholds.
