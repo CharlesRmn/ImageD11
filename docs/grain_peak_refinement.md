@@ -112,7 +112,8 @@ This reduces repeated backprojection work without changing peak fractions,
 spatial masks or the returned full reconstructions. The final iteration can take
 longer because it reconstructs the full image.
 
-Warm single-thread synthetic benchmarks with 401 translation bins, 180 initial
+The following benchmarks predate Chan–Vese masking and measure threshold-based
+feedback only. Warm single-thread synthetic benchmarks with 401 translation bins, 180 initial
 projections per grain and 403-by-403 reconstructions measured:
 
 | Grains | Iterations | Full feedback | ROI feedback | Speedup |
@@ -474,3 +475,93 @@ when plotting is disabled.
 The iteration-limit warning is independent of component-count selection. Results
 retain `converged=False` and their iteration diagnostics when the limit is reached;
 this change does not suppress that warning or alter convergence thresholds.
+
+### Sample-space level-set masks
+
+Refinement and its final masks now use morphological Chan–Vese segmentation
+inside each fixed sample-space ROI. `mask_level` selects an initial connected
+core nearest the grain centre; it is no longer the final mask cutoff. After
+clipping negative density and Gaussian-smoothing with sigma one pixel, evolve
+this seed for 40 steps with one curvature-smoothing operation per step and
+equal foreground/background weights. Density is normalized by its ROI maximum.
+The cropped ROI bounding box has a one-pixel zero background border; pixels
+outside the ROI supply zero-valued background samples, and the contour is
+constrained to the ROI after every step. Distant reconstruction streaks do not
+enter the region estimates.
+
+Keep the evolved connected component nearest the centre, fill holes, apply
+`dilation`, and clip to the ROI. Empty initial or evolved cores raise an error.
+The same helper serves ordinary refinement, spatial splits and twins. The
+spatial-split initializer still finds thresholded blobs before this feedback
+loop. Peak compatibility, projection support thresholds, intensity calibration,
+conservation and stopping rules are unchanged. Chan–Vese assumes distinguishable
+mean foreground/background densities; inspect the masks on real scans.
+
+The implementation uses scikit-image's
+[morphological Chan–Vese](https://scikit-image.org/docs/stable/api/skimage.segmentation.html#skimage.segmentation.morphological_chan_vese).
+
+## Hough initialization for sinusoid decoupling
+
+Use `initialization="hough"` to find candidate grain centres by voting in
+sample-position space, then refine their sinusoidal trajectories with the
+existing soft-L1 fit. Supply calibrated `y0`, or store it as `ds.y0`:
+
+```python
+decoupling_options["initialization"] = "hough"
+decoupling_options["y0"] = calibrated_y0
+grain_ids_to_decouple = {parent_id: 2}  # expected spatial branches
+# Use {parent_id: None} for automatic trajectory-count selection.
+```
+
+The same option works in direct `split_grain_sinogram` and
+`decouple_grain_sinograms` calls. For automatic batch screening, use
+`grain_ids=None, initialization="hough"` and inspect the existing report.
+Spatial initialization remains the default; `initialization="trajectory"`
+retains the original RANSAC implementation. Known twin pairs retain their
+exclusive-reflection initializer regardless of this option.
+
+For each measured `(omega, dty)`, the grain-centre hypothesis lies on the line
+
+```text
+-x * sin(omega) - y * cos(omega) = dty - y0
+```
+
+Lines from one spatial branch intersect near its centre. Voting rasterizes each
+line onto a 129-by-129 sample-space grid using linear deposition. It chooses
+which coordinate to solve for using the larger sine/cosine magnitude, avoiding
+tangent-transform singularities. A Jacobian factor compensates for this axis
+choice. Each occupied 15-degree angular sector contributes unit total vote
+weight; dense sampling, including repeated turns in one sector, cannot increase
+that sector's total weight.
+
+The first grid spans both coordinates from `-R` to `R`, where
+`R = 2 * max(width, max(abs(dty - y0)))`. Gaussian smoothing gives votes a
+finite trajectory width, with sigma `max(0.75, width / grid_spacing)` in grid
+pixels. Centre a finer grid on the largest accumulator maximum, with half-span
+four previous grid steps, and repeat until spacing is at most `width / 2`.
+The search is intended for broadly sampled trajectories; restricted angular
+coverage can leave position poorly determined, and a coarse maximum can miss
+a weak branch in difficult data.
+
+Fit the peaks within `width` of that candidate with the existing robust loss.
+Exclude peaks within `width` of previously found trajectories and vote again
+for the next branch. Finally, alternate the existing nearest-trajectory
+classification and joint robust fit. Hough initialization is deterministic:
+`seed`, `trials` and `ransac_confidence` do not control it. There is no fallback
+to RANSAC when a Hough candidate lacks sufficient support.
+
+Automatic count selection retains the blocked angular validation, minimum
+angular support, normalized Gaussian-mixture likelihood and one-standard-error
+rule. Both full-data and training-fold fits use Hough seeds. Final results
+record `stats["initialization"] = "hough"`; automatic-count diagnostics record
+`ransac_confidence=None`. Branch-envelope selection, Chan–Vese reconstruction
+masks, HKL compatibility and conserved fractional intensity feedback follow the
+same paths as trajectory initialization.
+
+Voting uses one fixed accumulator (about 130 KiB in float64), not a matrix of
+all peak/grid combinations. Temporary per-observation arrays remain linear in
+the selected parent's peak count: design coordinates use 16 bytes per row,
+with float64 target and weights and integer sector indices requiring another
+24 bytes per row on a 64-bit system. No arrays are added to the dataset's
+global peak table. Inspect recovered centres and masks on real scans; synthetic
+recovery does not establish improved real-data accuracy or runtime.

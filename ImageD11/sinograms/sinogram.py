@@ -1340,7 +1340,79 @@ def _decouple_ransac_one(omega, dty, width, rng, trials, fixed_y0=None, min_angl
     return (beta[:2], y0)
 
 
-def _decouple_fit_components(omega, dty, width, margin, fixed_y0=None, trials=600, seed=42, n_components=2, min_angle_bins=0, confidence=None):
+@numba.njit
+def _decouple_hough_votes(design, target, weights, lower, spacing, size):
+    """Rasterize a*x+b*y=target without dividing by a small coefficient."""
+    votes = np.zeros((size, size), dtype=np.float64)
+    for row in range(len(target)):
+        a, b = design[row, 0], design[row, 1]
+        solve_x = abs(a) >= abs(b)
+        divisor = a if solve_x else b
+        other = b if solve_x else a
+        origin = lower[0] if solve_x else lower[1]
+        other_origin = lower[1] if solve_x else lower[0]
+        # Jacobian compensates for choosing the better-conditioned grid axis.
+        weight = weights[row] / abs(divisor)
+        for index in range(size):
+            position = (target[row] - other * (other_origin + index * spacing)) / divisor
+            coordinate = (position - origin) / spacing
+            lo = int(np.floor(coordinate))
+            fraction = coordinate - lo
+            for offset in range(2):
+                pixel = lo + offset
+                if 0 <= pixel < size:
+                    value = weight * (fraction if offset else 1 - fraction)
+                    if solve_x:
+                        votes[pixel, index] += value
+                    else:
+                        votes[index, pixel] += value
+    return votes
+
+
+def _decouple_hough_one(omega, dty, width, fixed_y0, min_angle_bins=0):
+    """Seed a robust trajectory fit using sector-balanced sample-space votes.
+
+    A fixed 129-square grid is refined around its maximum until the spacing
+    is at most width/2. Each occupied 15-degree sector has unit total weight.
+    Only the grid, not a peak-by-grid matrix, is allocated for voting.
+    """
+    if fixed_y0 is None or not np.isfinite(fixed_y0):
+        raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
+    if not np.isfinite(width) or width <= 0:
+        raise ValueError("Hough trajectory width must be positive and finite")
+    if len(dty) < 8:
+        raise ValueError("Too few residual peaks for a Hough trajectory")
+    design = _refine_design(np.mod(omega, 360))
+    if np.linalg.matrix_rank(design) < 2:
+        raise RuntimeError("Hough initialization needs distinct projection directions")
+    target = np.asarray(dty) - fixed_y0
+    sectors = np.floor(np.mod(omega, 360) / 15).astype(int)
+    counts = np.bincount(sectors, minlength=24)
+    weights = 1.0 / counts[sectors]
+    centre = np.zeros(2)
+    radius = 2 * max(width, np.max(np.abs(target)))
+    size = 129
+    while True:
+        lower = centre - radius
+        spacing = 2 * radius / (size - 1)
+        votes = _decouple_hough_votes(design, target, weights, lower, spacing, size)
+        votes = gaussian_filter(votes, max(.75, width / spacing), mode="constant")
+        peak = np.asarray(np.unravel_index(np.argmax(votes), votes.shape))
+        centre = lower + spacing * peak
+        if spacing <= width / 2:
+            break
+        radius = 4 * spacing
+    inside = np.abs(np.dot(design, centre) - target) < width
+    if inside.sum() < 8 or len(np.unique(sectors[inside])) < min_angle_bins:
+        raise RuntimeError("Hough maximum has insufficient angular support")
+    fit = least_squares(
+        lambda c: np.dot(design[inside], c) - target[inside], centre,
+        loss="soft_l1", f_scale=width / 2,
+    )
+    return fit.x, float(fixed_y0)
+
+
+def _decouple_fit_components(omega, dty, width, margin, fixed_y0=None, trials=600, seed=42, n_components=2, min_angle_bins=0, confidence=None, hough=False):
     omega, dty = (np.asarray(omega), np.asarray(dty))
     if width <= 0 or margin < 0 or len(omega) != len(dty):
         raise ValueError("Invalid trajectory fitting inputs")
@@ -1348,13 +1420,18 @@ def _decouple_fit_components(omega, dty, width, margin, fixed_y0=None, trials=60
         raise ValueError("Trajectory fitting requires finite observations")
     X = _refine_design(omega)
     manual = min_angle_bins == 0 and confidence is None
-    if manual and hasattr(np.random, "Generator"):
+    if hough:
+        if fixed_y0 is None or not np.isfinite(fixed_y0):
+            raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
+    elif manual and hasattr(np.random, "Generator"):
         # The pre-automation manual initializer used the PCG64 stream.
         rng = np.random.Generator(np.random.PCG64(seed))
     else:
         rng = np.random.RandomState(seed)
 
     def fit_one(angles, values, offset):
+        if hough:
+            return _decouple_hough_one(angles, values, width, offset, min_angle_bins)
         if manual:
             return _decouple_ransac_one_manual(angles, values, width, rng, trials, offset)
         return _decouple_ransac_one(
@@ -1368,7 +1445,7 @@ def _decouple_fit_components(omega, dty, width, margin, fixed_y0=None, trials=60
                    and len(np.unique(angular_bins[labels == k])) >= min_angle_bins
                    for k in range(n_components))
 
-    for _ in range(8):
+    for _ in range(1 if hough else 8):
         c1, offset = fit_one(omega, dty, fixed_y0)
         centres = [c1]
         for component in range(1, n_components):
@@ -1451,7 +1528,7 @@ def _decouple_validation_losses(train_omega, train_dty, omega, dty,
 
 
 def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
-                             trials=600, seed=42, max_components=4, confidence=0.999):
+                             trials=600, seed=42, max_components=4, confidence=0.999, hough=False):
     """Select trajectories by blocked angular prediction and a one-SE rule.
 
     Selection uses normalized Gaussian mixture likelihoods with branch widths
@@ -1463,6 +1540,8 @@ def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
     """
     if confidence is not None and not 0 < confidence < 1:
         raise ValueError("RANSAC confidence must be between zero and one, or None")
+    if hough and (fixed_y0 is None or not np.isfinite(fixed_y0)):
+        raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
     if (isinstance(max_components, (bool, np.bool_))
             or not isinstance(max_components, (int, np.integer)) or max_components < 1):
         raise ValueError("max_components must be a positive integer")
@@ -1482,6 +1561,7 @@ def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
     folds = fold_of_sector[sectors]
     fine_sectors = np.floor(np.mod(omega, 360) / 15).astype(int)
     fits, losses, legacy_losses, counts, penalties, legacy_penalties = [], [], [], [], [], []
+    fit_options = dict(hough=True) if hough else {}
 
     def supported(labels, angles, count, minimum_bins):
         return all(np.sum(labels == k) >= 8
@@ -1491,7 +1571,7 @@ def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
     for count in range(1, min(max_components, len(omega) // 8) + 1):
         try:
             fit = _decouple_fit_components(
-                omega, dty, width, margin, fixed_y0, trials, seed, count, min_angle_bins=12, confidence=confidence)
+                omega, dty, width, margin, fixed_y0, trials, seed, count, min_angle_bins=12, confidence=confidence, **fit_options)
             if not supported(fit[2], fine_sectors, count, 12):
                 raise RuntimeError("Insufficient angular support for fitted tracks")
             heldout = np.empty(len(omega))
@@ -1500,7 +1580,7 @@ def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
                 train = folds != fold
                 centres, offset, labels = _decouple_fit_components(
                     omega[train], dty[train], width, margin, fixed_y0,
-                    trials, seed + fold + 1, count, min_angle_bins=8, confidence=confidence)
+                    trials, seed + fold + 1, count, min_angle_bins=8, confidence=confidence, **fit_options)
                 if not supported(labels, fine_sectors[train], count, 8):
                     raise RuntimeError("Insufficient angular support in a training fold")
                 heldout[~train], legacy_heldout[~train] = _decouple_validation_losses(
@@ -1533,7 +1613,7 @@ def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
         standard_error=float(legacy_losses[legacy_best].std(ddof=1) / np.sqrt(len(occupied))),
         selection_scores=scores.tolist(), selection_standard_error=float(standard_error),
         selection_method="normalized Gaussian mixture likelihood", minimum_angle_coverage=180,
-        ransac_confidence=confidence,
+        ransac_confidence=None if hough else confidence,
         ambiguous=int(np.sum(scores <= scores[best] + standard_error)) > 1,
         reached_limit=counts[chosen] == max_components and max_components < 4,
     )
@@ -1672,6 +1752,14 @@ def _refine_connected_grain_mask(
     geometry=None,
     smoothed_image=None,
 ):
+    """Evolve a threshold-seeded Chan-Vese contour in the sample-space ROI.
+
+    ``level`` initializes the contour; it is not the final density cutoff.
+    Crop to the fixed ROI so distant reconstruction streaks cannot affect the
+    foreground/background estimates or the cost of level-set evolution.
+    """
+    from skimage.segmentation import morphological_chan_vese
+
     if geometry is None:
         geometry = _refine_mask_geometry(image.shape, centre, ystep, radius)
     roi, distances = geometry
@@ -1686,6 +1774,30 @@ def _refine_connected_grain_mask(
     )
     if count == 0:
         raise RuntimeError("No connected core; lower mask_level")
+    nearest_label = components.flat[
+        np.argmin(np.where(components > 0, distances, np.inf))
+    ]
+    seed = binary_fill_holes(components == nearest_label) & roi
+    ri, rj = np.nonzero(roi)
+    # Include a background pixel around the ROI, including at image boundaries.
+    crop = (slice(ri.min(), ri.max() + 1), slice(rj.min(), rj.max() + 1))
+    local_roi = np.pad(roi[crop], 1, mode="constant")
+    density = np.pad(smoothed_image[crop], 1, mode="constant")
+    density[~local_roi] = 0
+    density /= density.max()
+
+    def constrain(contour):
+        contour[~local_roi] = 0
+
+    contour = morphological_chan_vese(
+        density, 40, init_level_set=np.pad(seed[crop], 1, mode="constant"),
+        smoothing=1, lambda1=1, lambda2=1, iter_callback=constrain,
+    )
+    mask = np.zeros_like(roi)
+    mask[crop] = contour[1:-1, 1:-1] > 0
+    components, count = ndi_label(mask & roi)
+    if count == 0:
+        raise RuntimeError("Chan-Vese segmentation lost the grain core; inspect ROI and mask_level")
     nearest_label = components.flat[
         np.argmin(np.where(components > 0, distances, np.inf))
     ]
@@ -2104,6 +2216,9 @@ def refine_grain_sinograms(
 
     Intermediate backprojections use each fixed grain ROI plus the halo needed
     for Gaussian smoothing. The final reconstruction covers the full image.
+    Sample-space supports use morphological Chan-Vese segmentation within each
+    fixed ROI (40 evolution steps, one smoothing step, equal region weights).
+    mask_level seeds the contour; dilation is applied after segmentation.
 
     Normal mode uses original cf_4d peaks, their grain_id labels (or best HKL
     matches), and existing saved fractional assignments to seed each grain.
@@ -2983,6 +3098,9 @@ def split_grain_sinogram(
 
     initialization="trajectory" explicitly enables the separate sinusoid-based
     initializer, with n_components=None opting into automatic count estimation.
+    initialization="hough" seeds those fits by deterministic, angularly balanced
+    Hough voting in sample space. It requires calibrated y0 or ds.y0; trials,
+    seed and ransac_confidence do not control Hough voting.
 
     With ``twin_grain``, preserve the two distinct UBIs. Reflections compatible
     with only one UBI seed its shape; only peaks compatible with both can be
@@ -2994,12 +3112,18 @@ def split_grain_sinogram(
     Uses full, uniformly increasing dty scans. No files or input grains are
     changed. Returned shapes/UBIs require inspection and separate refinement.
     ``peak_mask`` restricts rows before HKL scoring, retaining original indices.
-    ``ransac_confidence`` applies only to automatic count estimation. Spatial
-    initialization with a fixed count always uses the original full-trial solver.
+    ``ransac_confidence`` applies only to RANSAC automatic count estimation.
+    Trajectory initialization with a fixed count uses the original full-trial solver.
     """
-    if initialization not in ("spatial", "trajectory"):
-        raise ValueError("initialization must be 'spatial' or 'trajectory'")
+    if initialization not in ("spatial", "trajectory", "hough"):
+        raise ValueError("initialization must be 'spatial', 'trajectory' or 'hough'")
     spatial = twin_grain is None and initialization == "spatial"
+    hough = twin_grain is None and initialization == "hough"
+    fit_options = dict(hough=True) if hough else {}
+    if hough:
+        y0 = y0 if y0 is not None else getattr(ds, "y0", None)
+        if y0 is None or not np.isfinite(y0):
+            raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
     if spatial and n_components is None:
         raise ValueError("Spatial initialization requires an explicit expected component count")
     if ransac_confidence is not None and not 0 < ransac_confidence < 1:
@@ -3042,7 +3166,7 @@ def split_grain_sinogram(
     elif twin_grain is None:
         if n_components is None:
             initial = (_decouple_auto_components(
-                omega, dty, width, margin, y0, trials, seed, max_components, ransac_confidence)
+                omega, dty, width, margin, y0, trials, seed, max_components, ransac_confidence, **fit_options)
                 if _initial_fit is None else _initial_fit)
             centres, fitted_y0, labels4d, selection = initial
             n_components = len(centres)
@@ -3052,12 +3176,12 @@ def split_grain_sinogram(
                     " (ambiguous)" if selection["ambiguous"] else ""))
             if selection["reached_limit"]:
                 warnings.warn("Automatic count reached max_components; inspect tracks or increase the limit", RuntimeWarning)
-        # Automatic detection chooses the count only. Spatial initialization
-        # always uses the original fixed-count solver for multi-grain splits.
+        # Automatic detection chooses the count; refit using the selected
+        # trajectory initializer before learning full branch envelopes.
         if n_components > 1:
             centres, fitted_y0, labels4d = _decouple_fit_components(
                 omega, dty, width, margin, y0, trials, seed, n_components,
-                confidence=None)
+                confidence=None, **fit_options)
         originals = [grain] * n_components
     else:
         n_components = 2
@@ -3164,7 +3288,7 @@ def split_grain_sinogram(
     )
     for gs in refined.grainsinos:
         gs.peak_assignment_kind = "split"
-    refined.stats["initialization"] = "spatial_threshold" if spatial else "trajectory"
+    refined.stats["initialization"] = "spatial_threshold" if spatial else ("hough" if hough else "trajectory")
     if selection is not None:
         refined.stats["component_selection"] = selection
     result = GrainDecouplingResult(
@@ -3233,7 +3357,7 @@ def decouple_grain_sinograms(
     """Return updated grains and results for selected IDs/pairs or batch screening.
 
     The default spatial mode requires explicit expected counts. With
-    initialization="trajectory", grain_ids=None screens all parents except known twin pairs. Only
+    initialization="trajectory" or "hough", grain_ids=None screens all parents except known twin pairs. Only
     unambiguous multi-track parents below the search limit are reconstructed.
     Single-track, uncertain and failed parents retain their original objects.
     An optional report list receives one status dictionary per processed entry.
@@ -3275,8 +3399,8 @@ def decouple_grain_sinograms(
     if confidence is not None and not 0 < confidence < 1:
         raise ValueError("RANSAC confidence must be between zero and one, or None")
     batch = grain_ids is None
-    if batch and kwargs.get("initialization", "spatial") != "trajectory":
-        raise ValueError("Spatial decoupling requires manual expected counts; automatic sinusoid screening requires initialization='trajectory'")
+    if batch and kwargs.get("initialization", "spatial") not in ("trajectory", "hough"):
+        raise ValueError("Spatial decoupling requires manual expected counts; automatic sinusoid screening requires initialization='trajectory' or 'hough'")
     if batch and report is None:
         report = []
     pairs = [tuple(pair) for pair in twin_pairs]
@@ -3321,13 +3445,18 @@ def decouple_grain_sinograms(
                     [grains[entry[0]]], cf_4d, kwargs.get("hkl_tol", 0.05), peak_mask)
                 width = kwargs.get("width")
                 margin = kwargs.get("margin")
+                hough = kwargs.get("initialization") == "hough"
+                axis = kwargs.get("y0")
+                if hough and axis is None:
+                    axis = getattr(ds, "y0", None)
+                fit_options = dict(hough=True) if hough else {}
                 initial = _decouple_auto_components(
                     cf_4d.omega[selected], cf_4d.dty[selected],
                     2 * float(ds.ystep) if width is None else float(width),
                     float(ds.ystep) if margin is None else float(margin),
-                    kwargs.get("y0"), kwargs.get("trials", 600),
+                    axis, kwargs.get("trials", 600),
                     kwargs.get("seed", 42), kwargs.get("max_components", 4),
-                    kwargs.get("ransac_confidence", 0.999))
+                    kwargs.get("ransac_confidence", 0.999), **fit_options)
                 selection = initial[3]
                 record.update(n_components=len(initial[0]), component_selection=selection)
                 if selection["ambiguous"] or selection["reached_limit"]:
