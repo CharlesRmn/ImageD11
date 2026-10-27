@@ -1,4 +1,5 @@
 from functools import partial
+from contextlib import contextmanager
 import copy
 import os
 from pathlib import Path
@@ -1124,7 +1125,7 @@ def _refine_group_rows(values):
     return order, boundaries
 
 
-@numba.njit
+@numba.njit(nogil=True)
 def _refine_project_kernel(
     sx,
     sy,
@@ -2172,6 +2173,18 @@ def _refine_seed_geometry(originals, ids, cf_4d, owners, saved, centres, y0, ste
     return centres, y0s
 
 
+@contextmanager
+def _refine_grain_pool(workers):
+    """Reuse grain threads across stages; serial execution needs no executor."""
+    if workers == 1:
+        yield map
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            yield pool.map
+
+
 def refine_grain_sinograms(
     ds,
     grains,
@@ -2199,6 +2212,7 @@ def refine_grain_sinograms(
     initial_weights=None,
     compatibility=None,
     intensity_budget=None,
+    workers=None,
 ):
     """Refine peak selection by back/forward projection for any number of grains.
 
@@ -2213,6 +2227,16 @@ def refine_grain_sinograms(
     result.stats contains final counts, assigned intensity and elapsed time;
     result.history records weight changes and assignment transitions per
     iteration. verbose=False disables the bar and printed statistics.
+
+    workers=None (default) uses all available CPU cores, respecting CPU
+    affinity and capped at the number of selected grains. A positive integer
+    sets an explicit number of grain threads. One
+    persistent pool shares the prepared full peak table without per-worker table
+    copies. Each grain owns its participating-row subset and reconstruction.
+    Reconstructions and forward projections run concurrently; mask segmentation
+    stays ordered because scikit-image shares curvature-smoothing state.
+    Joint peak assignment runs after all grain projections complete. Internal
+    reconstruction workers stay at one. workers=1 keeps serial execution.
 
     Intermediate backprojections use each fixed grain ROI plus the halo needed
     for Gaussian smoothing. The final reconstruction covers the full image.
@@ -2249,6 +2273,14 @@ def refine_grain_sinograms(
     """
     from ImageD11.sinograms.geometry import sino_shift_and_pad
 
+    if workers is None:
+        workers = ImageD11.cImageD11.cores_available()
+    if (
+        isinstance(workers, (bool, np.bool_))
+        or not isinstance(workers, (int, np.integer))
+        or workers < 1
+    ):
+        raise ValueError("workers must be a positive integer")
     started = perf_counter()
     ids = tuple(range(len(grains))) if grain_ids is None else tuple(grain_ids)
     if (
@@ -2301,7 +2333,7 @@ def refine_grain_sinograms(
     originals = [grains[gid] for gid in ids]
     n = len(ids)
     total_steps = 1 + 2 * n * (iterations + 1) + int(cf_strong is not None)
-    with tqdm(
+    with _refine_grain_pool(min(int(workers), n)) as grain_map, tqdm(
         total=total_steps,
         desc="Preparing refinement",
         unit="step",
@@ -2489,16 +2521,6 @@ def refine_grain_sinograms(
             child.translation = np.r_[centres[k], z]
             gs = GrainSinogram(child, ds)
             gs.peak_assignment_kind = "refined"
-            _refine_rebuild_sinogram(
-                gs,
-                cf2,
-                weights[:, k],
-                y0s[k],
-                geometry[k][0],
-                pad,
-                filter_name,
-                recon_mask=reconstruction_masks[k],
-            )
             sinos.append(gs)
             key = original.ubi.tobytes()
             if key not in reflection_cache:
@@ -2512,6 +2534,16 @@ def refine_grain_sinograms(
             labels, groups = reflection_cache[key]
             reflection_ids.append(labels)
             reflection_groups.append(groups)
+        final_iteration = False
+
+        def rebuild(k):
+            return _refine_rebuild_sinogram(
+                sinos[k], cf2, weights[:, k], y0s[k], geometry[k][0], pad,
+                filter_name,
+                recon_mask=None if final_iteration else reconstruction_masks[k],
+            )
+
+        for gs in grain_map(rebuild, range(n)):
             progress.update(1)
         reflection_ids = np.column_stack(reflection_ids)
         angle_groups = _refine_group_rows(cf2.omega)
@@ -2522,7 +2554,7 @@ def refine_grain_sinograms(
             smoothed = [
                 gaussian_filter(np.maximum(gs.recons["iradon"], 0), 1) for gs in sinos
             ]
-            projections, mask_pixels = [], []
+            masks, mask_pixels = [], []
             for k, gs in enumerate(sinos):
                 mask = _refine_connected_grain_mask(
                     gs.recons["iradon"],
@@ -2535,20 +2567,18 @@ def refine_grain_sinograms(
                     smoothed[k],
                 )
                 mask_pixels.append(int(mask.sum()))
-                projections.append(
-                    _refine_project_grain_profile(
-                        mask,
-                        gs.recons["iradon"],
-                        cf2.omega,
-                        cf2.dty,
-                        y0s[k],
-                        step,
-                        support_level,
-                        beam_sigma_steps,
-                        angle_groups,
-                        smoothed[k],
-                    )
+                masks.append(mask)
+
+            def project(k):
+                return _refine_project_grain_profile(
+                    masks[k], sinos[k].recons["iradon"], cf2.omega, cf2.dty,
+                    y0s[k], step, support_level, beam_sigma_steps,
+                    angle_groups, smoothed[k],
                 )
+
+            projections = []
+            for projection in grain_map(project, range(n)):
+                projections.append(projection)
                 progress.update(1)
             progress.set_description(
                 "Iteration {}: peak assignment".format(iteration + 1)
@@ -2628,17 +2658,7 @@ def refine_grain_sinograms(
             )
             stable = delta < weight_tolerance and maximum < 5 * weight_tolerance
             final_iteration = stable or iteration + 1 == iterations
-            for k, gs in enumerate(sinos):
-                _refine_rebuild_sinogram(
-                    gs,
-                    cf2,
-                    weights[:, k],
-                    y0s[k],
-                    geometry[k][0],
-                    pad,
-                    filter_name,
-                    recon_mask=None if final_iteration else reconstruction_masks[k],
-                )
+            for gs in grain_map(rebuild, range(n)):
                 progress.update(1)
             if not np.allclose(
                 weights[supports.any(axis=1)].sum(axis=1), budget[supports.any(axis=1)]
@@ -2975,7 +2995,7 @@ def _decouple_threshold_components(image, count, step, level, dilation,
     if not np.isfinite(smooth).all() or smooth.max() <= 0:
         raise RuntimeError("Parent reconstruction has no finite positive density")
     components, found = ndi_label(smooth >= level * smooth.max())
-    if found < count or (found != count and not keep_largest):
+    if found == 0 or (found > count and not keep_largest):
         raise RuntimeError(
             "Spatial threshold found {} disconnected blobs; expected {}. "
             "Inspect the parent reconstruction and mask_level; no blobs were "
@@ -3034,6 +3054,7 @@ def _decouple_spatial_initialization(ds, grain, cf2, count, y0, mask_level,
     centres, masks, radii, smooth = _decouple_threshold_components(
         parent.recons["iradon"], count, float(ds.ystep), mask_level, dilation,
         keep_largest=keep_largest, diagnostics=diagnostics)
+    count = len(centres)
     profiles = np.empty((cf2.nrows, count))
     supports = np.empty((cf2.nrows, count), dtype=bool)
     angle_groups = _refine_group_rows(cf2.omega)
@@ -3086,6 +3107,7 @@ def split_grain_sinogram(
     ransac_confidence=0.999,
     initialization="spatial",
     spatial_keep_largest=True,
+    workers=None,
 ):
     """Decouple one mixed orientation, or two known twin-related orientations.
 
@@ -3094,7 +3116,8 @@ def split_grain_sinogram(
     select seed peaks, then refine by back/forward projection. This default path
     fits no sinusoids and requires calibrated y0 or ds.y0. When extra blobs are
     present, spatial_keep_largest=True retains the requested count by pixel area
-    and reports exclusions. False requires an exact count; too few always raises.
+    and reports exclusions. False rejects extra blobs. If fewer blobs are found,
+    use the detected count, including a single blob.
 
     initialization="trajectory" explicitly enables the separate sinusoid-based
     initializer, with n_components=None opting into automatic count estimation.
@@ -3107,7 +3130,8 @@ def split_grain_sinogram(
     shared. This also permits co-centred twins provided exclusive reflections
     resolve their shapes. The twin law/second orientation is NOT inferred.
     Both initializers delegate reconstruction and projection feedback to
-    refine_grain_sinograms().
+    refine_grain_sinograms(), including its workers setting (None uses all
+    available cores, capped at the number of components).
 
     Uses full, uniformly increasing dty scans. No files or input grains are
     changed. Returned shapes/UBIs require inspection and separate refinement.
@@ -3210,7 +3234,7 @@ def split_grain_sinogram(
     )
     cf2.filter(valid2d)
     compatible2d = compatible2d[valid2d]
-    if cf2.nrows < 20 * n_components:
+    if cf2.nrows < 20 * (1 if spatial else n_components):
         raise ValueError("Too few valid compatible 2D peaks to decouple")
     spatial_diagnostics = {}
     if spatial:
@@ -3218,6 +3242,9 @@ def split_grain_sinogram(
             ds, grain, cf2, n_components, fitted_y0, mask_level, dilation,
             support_level, beam_sigma_steps, filter_name, minimum_exclusive,
             keep_largest=spatial_keep_largest, diagnostics=spatial_diagnostics)
+        n_components = len(centres)
+        originals = [grain] * n_components
+        compatible2d = compatible2d[:, :n_components]
         if verbose and spatial_diagnostics:
             print("Spatial initialization kept {} of {} regions; excluded {} regions ({} pixels).".format(
                 n_components, spatial_diagnostics["found"],
@@ -3285,6 +3312,7 @@ def split_grain_sinogram(
         minimum_exclusive=minimum_exclusive,
         verbose=verbose,
         use_saved_assignments=False,
+        workers=workers,
     )
     for gs in refined.grainsinos:
         gs.peak_assignment_kind = "split"

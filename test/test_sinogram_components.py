@@ -43,6 +43,7 @@ def test_component_child_ids(selection, expected):
     table = SimpleNamespace(titles=[])
 
     def split(*args, **kwargs):
+        assert kwargs['workers'] == 2
         count = kwargs['n_components']
         if isinstance(selection, list):
             assert count == 2
@@ -57,7 +58,7 @@ def test_component_child_ids(selection, expected):
     with patch.object(sino, '_refine_peak_owners', return_value=np.array([0, 2])), \
             patch.object(sino, 'split_grain_sinogram', side_effect=split):
         updated, results = sino.decouple_grain_sinograms(
-            None, grains, table, grain_ids=selection,
+            None, grains, table, grain_ids=selection, workers=2,
          initialization='trajectory')
     assert [result.child_ids for result in results] == expected
     assert updated[1] is grains[1]
@@ -709,14 +710,23 @@ def test_spatial_threshold_counts_disconnected_blobs(count):
     np.testing.assert_allclose(centres, expected, atol=.001)
 
 
-def test_spatial_threshold_does_not_force_a_requested_count():
+@pytest.mark.parametrize('keep_largest', [False, True])
+def test_spatial_threshold_uses_fewer_blobs(keep_largest):
     ri, rj = np.indices((101, 101))
     image = np.exp(-((ri - 50) ** 2 + (rj - 50) ** 2) / 18.)
-    with pytest.raises(RuntimeError, match='found 1 disconnected blobs; expected 2'):
-        sino._decouple_threshold_components(image, 2, .01, .12, 2)
+    diagnostics = {}
+    centres, masks, radii, _ = sino._decouple_threshold_components(
+        image, 2, .01, .12, 2, keep_largest=keep_largest, diagnostics=diagnostics)
+    assert centres.shape == (1, 2)
+    assert len(masks) == len(radii) == 1
+    assert diagnostics['expected'] == 2
+    assert diagnostics['found'] == 1
+    assert diagnostics['excluded_region_ids'] == []
 
 
-def test_default_spatial_split_bypasses_all_sinusoid_initializers():
+@pytest.mark.parametrize('count', [1, 2])
+@pytest.mark.parametrize('workers', [None, 2])
+def test_default_spatial_split_bypasses_all_sinusoid_initializers(count, workers):
     ds = SimpleNamespace(ystep=1., ybincens=np.arange(-100., 101.), y0=0.,
                          pk2d={'spot3d_id': np.arange(120)})
     grain = SimpleNamespace(ubi=np.eye(3), name='parent')
@@ -724,22 +734,25 @@ def test_default_spatial_split_bypasses_all_sinusoid_initializers():
                           spot3d_id=np.arange(120), parameters=None)
     cf2 = SimpleNamespace(nrows=120, omega=np.arange(120.), dty=np.zeros(120),
                           eta=np.ones(120), sum_intensity=np.ones(120), filter=lambda mask: None)
-    centres = np.array([[-20., -10.], [15., 15.]])
-    weights = np.column_stack((np.arange(120) < 60, np.arange(120) >= 60)).astype(float)
-    refined = SimpleNamespace(grainsinos=[SimpleNamespace(), SimpleNamespace()],
+    centres = np.array([[-20., -10.], [15., 15.]])[:count]
+    weights = np.eye(count)[np.arange(120) % count]
+    refined = SimpleNamespace(grainsinos=[SimpleNamespace() for _ in range(count)],
                               centres=centres, source_2d_rows=np.arange(120), peak_weights=weights,
                               history=[], converged=True, stats={})
     with patch.object(sino, '_refine_errors',
                       side_effect=lambda grains, cf: np.zeros((cf.nrows, len(grains)))), \
             patch.object(sino, '_refine_colfile_from_rows', return_value=cf2), \
             patch.object(sino, '_decouple_spatial_initialization',
-                         return_value=(centres, weights, np.array([10., 10.]))) as spatial, \
+                         return_value=(centres, weights, np.full(count, 10.))) as spatial, \
             patch.object(sino, '_decouple_auto_components', side_effect=AssertionError('sin fit')), \
             patch.object(sino, '_decouple_fit_components', side_effect=AssertionError('sin fit')), \
             patch.object(sino, '_decouple_ransac_one', side_effect=AssertionError('RANSAC')), \
             patch.object(sino, '_decouple_select_full_branches', side_effect=AssertionError('trajectory')), \
             patch.object(sino, 'refine_grain_sinograms', return_value=([], refined)) as feedback:
-        result = sino.split_grain_sinogram(ds, grain, cf4, verbose=False)
+        result = sino.split_grain_sinogram(ds, grain, cf4, verbose=False, workers=workers)
+    assert feedback.call_args.kwargs['workers'] == workers
+    assert len(feedback.call_args.args[1]) == count
+    assert feedback.call_args.kwargs['compatibility'].shape == (120, count)
     assert spatial.call_count == 1
     assert spatial.call_args.kwargs['keep_largest'] is True
     assert spatial.call_args.args[4] == ds.y0
@@ -750,7 +763,8 @@ def test_default_spatial_split_bypasses_all_sinusoid_initializers():
     assert np.all(result.labels4d == -1)
 
 
-def test_spatial_initializer_uses_real_back_and_forward_projection():
+@pytest.mark.parametrize('requested_count', [2, 3])
+def test_spatial_initializer_uses_real_back_and_forward_projection(requested_count):
     angles = np.arange(0., 360., 6.)
     grid = np.arange(-.65, .65001, .01)
     centres = np.array([[-.2, -.1], [.2, .15]])
@@ -776,7 +790,7 @@ def test_spatial_initializer_uses_real_back_and_forward_projection():
             patch.object(sino, '_refine_rebuild_sinogram', side_effect=reconstruct), \
             patch.object(sino, '_decouple_ransac_one', side_effect=AssertionError('RANSAC')):
         fitted, weights, radii = sino._decouple_spatial_initialization(
-            ds, SimpleNamespace(ubi=np.eye(3)), cf, 2, 0., .12, 2, .02, .75, 'hann', 5)
+            ds, SimpleNamespace(ubi=np.eye(3)), cf, requested_count, 0., .12, 2, .02, .75, 'hann', 5)
     np.testing.assert_allclose(fitted, centres, atol=.02)
     active = weights.sum(axis=1) > 0
     np.testing.assert_allclose(weights[active].sum(axis=1), 1.)
@@ -819,8 +833,6 @@ def test_largest_spatial_regions_exclude_and_report_26_speckles():
         sino._decouple_threshold_components(image, 2, .01, .12, 2, keep_largest=False)
 
 
-def test_largest_region_selection_still_rejects_too_few_components():
-    ri, rj = np.indices((61, 61))
-    image = np.exp(-((ri - 30) ** 2 + (rj - 30) ** 2) / 18.)
-    with pytest.raises(RuntimeError, match='found 1 disconnected blobs; expected 2'):
-        sino._decouple_threshold_components(image, 2, .01, .12, 2, keep_largest=True)
+def test_spatial_threshold_rejects_zero_blobs():
+    with pytest.raises(RuntimeError, match='found 0 disconnected blobs'):
+        sino._decouple_threshold_components(np.ones((10, 10)), 2, .01, 2., 2)

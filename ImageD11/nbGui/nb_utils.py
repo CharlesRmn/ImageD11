@@ -764,6 +764,275 @@ def plot_index_results(ind, colfile, title):
     plt.show()
 
 
+def plot_sinograms_hough(colfile, y0, radius=None, bins=257,
+                         title="All peaks in Hough space", unassigned_only=False,
+                         spatial_mask=None):
+    """Plot peak sinograms and their combined sample-position Hough votes.
+
+    Includes assigned and unassigned peaks by default. unassigned_only=True
+    selects grain_id == -1, exactly as plot_index_results does. y0 is the
+    calibrated rotation-axis dty, in the same units as colfile.dty. The mapping
+    is dty - y0 = -x*sin(omega) - y*cos(omega). Bright intersections suggest
+    spatial centres, not indexed grain orientations.
+
+    radius bounds both sample coordinates to [-radius, radius]; by default it
+    is twice max(abs(dty - y0)) for the finite selected peaks. bins is the
+    number of grid centres on each axis. Every finite selected peak votes,
+    without intensity weighting, thresholding or angular rebinning. Votes use
+    the same rasterization and geometric correction as the Hough initializer.
+    The accumulator is displayed as log1p(votes), without smoothing.
+    spatial_mask optionally supplies a (bins, bins) mask in displayed image
+    order: rows are sample y, columns sample x, with origin at the lower left.
+    True/nonzero pixels remain visible; other pixels are hidden. The mask must
+    use this plot's radius and grid; reconstruction masks need coordinate
+    conversion first. Masking affects only the Hough image, not peak selection
+    or voting. Inputs are unchanged.
+    Returns (fig, axes); does not show the figure or modify the table.
+    """
+    from ImageD11.sinograms.sinogram import _refine_design, _decouple_hough_votes
+
+    if not np.isscalar(y0) or not np.isfinite(y0):
+        raise ValueError("Supply a finite scalar calibrated y0")
+    if (isinstance(bins, (bool, np.bool_))
+            or not isinstance(bins, (int, np.integer)) or bins < 2):
+        raise ValueError("bins must be an integer of at least two")
+    if spatial_mask is not None:
+        spatial_mask = np.asarray(spatial_mask, dtype=bool)
+        if spatial_mask.shape != (bins, bins):
+            raise ValueError("spatial_mask must have shape (bins, bins) in displayed Hough coordinates")
+    selected = np.isfinite(colfile.omega) & np.isfinite(colfile.dty)
+    if unassigned_only:
+        selected &= colfile.grain_id == -1
+    selection_name = "unassigned peaks" if unassigned_only else "peaks (all assignments)"
+    if not selected.any():
+        raise ValueError("No finite {} to plot".format(selection_name))
+    omega = np.mod(colfile.omega[selected], 360)
+    dty = colfile.dty[selected]
+    target = dty - y0
+    radius = 2 * np.max(np.abs(target)) if radius is None else radius
+    if not np.isscalar(radius) or not np.isfinite(radius) or radius <= 0:
+        raise ValueError("Supply a positive finite radius")
+    spacing = 2.0 * radius / (bins - 1)
+    votes = _decouple_hough_votes(
+        _refine_design(omega), target, np.ones(len(omega)),
+        np.array([-radius, -radius]), spacing, int(bins))
+
+    hough_image = np.log1p(votes.T)
+    if spatial_mask is not None:
+        hough_image = np.ma.array(hough_image, mask=~spatial_mask)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+    fig.suptitle(title)
+    axes[0].scatter(omega, dty, s=2)
+    axes[0].set(xlabel="omega modulo 360 (degrees)", ylabel="dty",
+                title="{} finite {}".format(len(omega), selection_name))
+    edge = radius + spacing / 2
+    image = axes[1].imshow(hough_image, origin="lower",
+                           extent=(-edge, edge, -edge, edge),
+                           interpolation="nearest", aspect="equal")
+    axes[1].set(xlabel="Sample x (dty units)", ylabel="Sample y (dty units)",
+                title="Hough accumulator (y0={:.6g})".format(y0))
+    fig.colorbar(image, ax=axes[1], label="log(1 + geometrically weighted votes)")
+    return fig, axes
+
+
+def plot_unassigned_hough(colfile, y0, radius=None, bins=257,
+                          title="Unassigned peaks in Hough space", spatial_mask=None):
+    """Plot grain_id == -1 peaks; spatial_mask follows plot_sinograms_hough."""
+    return plot_sinograms_hough(colfile, y0, radius=radius, bins=bins,
+                                title=title, unassigned_only=True, spatial_mask=spatial_mask)
+
+
+def hough_grain_picker(cf, y0, radius, bins=409, spatial_mask=None):
+    """Interactively propose centres from unassigned peaks; return picker state.
+
+    spatial_mask uses displayed Hough coordinates (rows y, columns x, origin
+    lower left). Sliders operate on linear votes; only the overview uses log1p.
+    State centres are updated when sliders change. No grains or peaks change.
+    Widget imports are lazy so batch utilities do not require ipywidgets.
+    """
+    import ipywidgets as widgets
+    from IPython.display import display
+    from scipy.ndimage import gaussian_filter
+    from skimage.feature import peak_local_max
+    from ImageD11.sinograms.sinogram import _refine_design, _decouple_hough_votes
+
+    if not np.isfinite(radius) or radius <= 0 or not np.isfinite(y0):
+        raise ValueError("Supply a positive finite radius and calibrated finite y0")
+    if (isinstance(bins, (bool, np.bool_))
+            or not isinstance(bins, (int, np.integer)) or bins < 2):
+        raise ValueError("bins must be an integer of at least two")
+    inside = (np.ones((bins, bins), dtype=bool) if spatial_mask is None
+              else np.asarray(spatial_mask, dtype=bool))
+    if inside.shape != (bins, bins) or not inside.any():
+        raise ValueError("spatial_mask must be a nonempty (bins, bins) mask")
+    rows = np.flatnonzero((cf.grain_id == -1) & np.isfinite(cf.omega)
+                         & np.isfinite(cf.dty))
+    if not len(rows):
+        raise ValueError("No finite unassigned peaks")
+    omega, dty = np.mod(cf.omega[rows], 360), cf.dty[rows].copy()
+    spacing = 2.0 * radius / (bins - 1)
+    votes = _decouple_hough_votes(
+        _refine_design(omega), dty - y0, np.ones(len(rows)),
+        np.array([-radius, -radius]), spacing, int(bins)).T
+    state = dict(cf=cf, rows=rows, omega=omega, dty=dty, y0=y0,
+                 centres=np.empty((0, 2)), strengths=np.empty(0),
+                 votes=votes, spacing=spacing)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
+    edge = radius + spacing / 2
+    image_options = dict(origin="lower", extent=(-edge, edge, -edge, edge),
+                         interpolation="nearest", aspect="equal")
+    axes[0].imshow(np.ma.array(np.log1p(votes), mask=~inside), **image_options)
+    axes[0].set_title("Unassigned peaks: log(1 + Hough votes)")
+    response_image = axes[1].imshow(
+        np.ma.array(np.zeros_like(votes), mask=~inside), **image_options)
+    points = axes[1].scatter([], [], facecolors="none", edgecolors="red", s=65)
+    annotations = []
+    for ax in axes:
+        ax.set(xlabel="Sample x (dty units)", ylabel="Sample y (dty units)")
+    status = widgets.HTML()
+
+    def update(smoothing, background, threshold, separation, maximum):
+        smooth = gaussian_filter(votes, smoothing)
+        broad = gaussian_filter(votes, max(background, 2 * smoothing))
+        response = np.maximum(smooth - broad, 0)
+        response[~inside] = 0
+        pixels = (peak_local_max(
+            response, min_distance=separation,
+            threshold_abs=threshold * response.max(), exclude_border=False,
+            labels=inside.astype(np.uint8), num_peaks=maximum)
+            if response.max() > 0 else np.empty((0, 2), dtype=int))
+        strengths = response[pixels[:, 0], pixels[:, 1]]
+        order = np.argsort(-strengths)
+        pixels, strengths = pixels[order], strengths[order]
+        centres = np.column_stack((-radius + pixels[:, 1] * spacing,
+                                   -radius + pixels[:, 0] * spacing))
+        state.update(centres=centres, strengths=strengths, response=response)
+        response_image.set_data(np.ma.array(response, mask=~inside))
+        response_image.set_clim(0, max(float(response.max()), 1e-12))
+        points.set_offsets(centres)
+        for annotation in annotations:
+            annotation.remove()
+        annotations[:] = []
+        for k, (x, y) in enumerate(centres):
+            annotations.append(axes[1].annotate(str(k), (x, y), color="red", fontsize=8))
+        axes[1].set_title("Background-subtracted candidate maxima")
+        status.value = "{} candidates; spacing {:.6g}; separation {:.6g} dty units".format(
+            len(centres), spacing, separation * spacing)
+        fig.canvas.draw_idle()
+
+    controls = dict(
+        smoothing=widgets.FloatSlider(value=1, min=0, max=5, step=.25, description="Smooth px"),
+        background=widgets.FloatSlider(value=10, min=2, max=40, step=1, description="Background px"),
+        threshold=widgets.FloatSlider(value=.2, min=.01, max=.95, step=.01, description="Threshold"),
+        separation=widgets.IntSlider(value=6, min=1, max=30, description="Separation px"),
+        maximum=widgets.IntSlider(value=50, min=1, max=200, description="Max candidates"))
+    output = widgets.interactive_output(update, controls)
+    display(widgets.VBox([controls[name] for name in
+            ("smoothing", "background", "threshold", "separation", "maximum")] + [status]), output)
+    plt.show()
+    state.update(figure=fig, controls=controls, output=output)
+    return state
+
+
+def candidate_peak_tables(picker, trajectory_width, candidate_ids=None):
+    """Copy original unassigned rows within a trajectory half-width in dty units.
+
+    Tables may overlap. No peak ownership changes. Candidate IDs refer to the
+    current slider state; rerun indexing after changing that state.
+    """
+    if not np.isfinite(trajectory_width) or trajectory_width <= 0:
+        raise ValueError("trajectory_width must be positive and finite")
+    ids = (range(len(picker["centres"])) if candidate_ids is None else candidate_ids)
+    angle = np.deg2rad(picker["omega"])
+    tables = {}
+    for k in ids:
+        x, y = picker["centres"][k]
+        prediction = picker["y0"] - x * np.sin(angle) - y * np.cos(angle)
+        keep = np.abs(picker["dty"] - prediction) <= trajectory_width
+        tables[k] = picker["cf"].copyrows(picker["rows"][keep])
+    return tables
+
+
+def index_hough_candidates(picker, trajectory_width, indexing_options, candidate_ids=None):
+    """Index each candidate table using explicit existing indexing options.
+
+    Result centres are snapshots, independent of subsequent slider changes.
+    Returned proposals require inspection; existing grains are not modified.
+    """
+    tables = candidate_peak_tables(picker, trajectory_width, candidate_ids)
+    results = {}
+    for k, table in sorted(tables.items()):
+        if table.nrows:
+            found, indexer = do_index(table, **indexing_options)
+            results[k] = dict(centre=picker["centres"][k].copy(), grains=found,
+                              indexer=indexer, peaks=table)
+    return results
+
+
+def select_hough_grains(grains, results, tol):
+    """Select indexed proposals with enough additional HKL-compatible peaks.
+
+    Visit candidates in ID order and orientations in indexer order. Existing
+    and previously selected UBIs reserve their matching peaks. Require the
+    candidate indexer's own minpks, rounded up, on the remaining peaks. This
+    removes redundant proposals without an additional misorientation cutoff.
+    Return (accepted_pairs, report); inputs are unchanged.
+    """
+    accepted, report = [], []
+    known = list(grains)
+    for candidate, result in sorted(results.items()):
+        cf = result["peaks"]
+        gv = np.ascontiguousarray(np.column_stack((cf.gx, cf.gy, cf.gz)))
+        labels = np.full(cf.nrows, -1, dtype=np.int32)
+        errors = np.ones(cf.nrows)
+        for k, g in enumerate(known):
+            ImageD11.cImageD11.score_and_assign(g.ubi, gv, tol, errors, labels, k)
+        available = labels < 0
+        minimum = max(1, int(np.ceil(result["indexer"].minpks)))
+        for orientation, g in enumerate(result["grains"]):
+            proposal_labels = np.full(cf.nrows, -1, dtype=np.int32)
+            ImageD11.cImageD11.score_and_assign(
+                g.ubi, gv, tol, np.ones(cf.nrows), proposal_labels, 0)
+            matched = available & (proposal_labels == 0)
+            count = int(matched.sum())
+            keep = count >= minimum
+            report.append(dict(candidate=candidate, orientation=orientation,
+                               new_peaks=count, minimum=minimum, accepted=keep))
+            if keep:
+                accepted.append((candidate, orientation))
+                known.append(g)
+                available[matched] = False
+    return accepted, report
+
+
+def add_hough_grains(grains, results, accepted):
+    """Append explicitly accepted (candidate ID, orientation ID) proposals.
+
+    Assign list-position gids and the candidate centre as translation (z=0).
+    Existing grains and proposals are unchanged. No automatic orientation
+    merging: inspect candidates for duplicate orientations before accepting.
+    Reassign peaks after this function; it changes no columnfile or file.
+    """
+    import copy
+
+    choices = [tuple(choice) for choice in accepted]
+    for choice in choices:
+        if (len(choice) != 2 or any(isinstance(i, (bool, np.bool_))
+                or not isinstance(i, (int, np.integer)) or i < 0 for i in choice)):
+            raise ValueError("Accepted choices must be nonnegative candidate/orientation ID pairs")
+    if len(set(choices)) != len(choices):
+        raise ValueError("Each accepted candidate/orientation pair must be unique")
+    updated = list(grains)
+    for candidate, orientation in choices:
+        result = results[candidate]
+        g = copy.deepcopy(result["grains"][orientation])
+        g.gid = len(updated)
+        g.translation = np.r_[result["centre"], 0.]
+        updated.append(g)
+    return updated
+
+
 def plot_grain_sinograms(grains, cf, n_grains_to_plot=None):
     if n_grains_to_plot is None:
         n_grains_to_plot = len(grains)

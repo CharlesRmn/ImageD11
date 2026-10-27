@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import warnings
+import threading
 
 import numpy as np
 import pytest
@@ -74,7 +75,9 @@ def test_boundary_roi_has_a_background_border_and_retains_coordinates():
     assert not mask[~roi].any()
 
 
-def test_feedback_conserves_budget_and_matches_full_backprojection(monkeypatch):
+@pytest.mark.parametrize("workers", [None, 1, 2, 4])
+@pytest.mark.parametrize("iterations", [0, 3])
+def test_feedback_conserves_budget_and_matches_full_backprojection(monkeypatch, workers, iterations):
     # Gaussian spatial phantoms have Gaussian line projections. Distinct
     # integer g-vectors here identify the synthetic reflection at each angle.
     angles = np.arange(0., 360., 10.)
@@ -102,14 +105,42 @@ def test_feedback_conserves_budget_and_matches_full_backprojection(monkeypatch):
               for c in centres]
     options = dict(cf_2d=cf, initial_weights=weights * budget[:, None],
                    centres=centres, y0=.03, roi_radius=.12,
-                   intensity_budget=budget, iterations=3, verbose=False)
+                   intensity_budget=budget, iterations=iterations, verbose=False)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        updated, result = sino.refine_grain_sinograms(ds, grains, **options)
+        _, serial = sino.refine_grain_sinograms(ds, grains, workers=1, **options)
+        monkeypatch.setattr(sino.ImageD11.cImageD11, "cores_available", lambda: 8)
+        expected_workers = min(8 if workers is None else workers, len(grains))
+        tables, threads = [], set()
+        barrier = threading.Barrier(2) if expected_workers > 1 else None
+        rebuild = sino._refine_rebuild_sinogram
+
+        def checked_rebuild(gs, table, *args, **kwargs):
+            tables.append(table)
+            threads.add(threading.current_thread().ident)
+            if barrier is not None:
+                barrier.wait(timeout=30)
+            return rebuild(gs, table, *args, **kwargs)
+
+        monkeypatch.setattr(sino, "_refine_rebuild_sinogram", checked_rebuild)
+        worker_options = {} if workers is None else dict(workers=workers)
+        updated, result = sino.refine_grain_sinograms(ds, grains, **dict(options, **worker_options))
+        assert all(table is tables[0] for table in tables)
+        assert len(threads) == expected_workers
+        np.testing.assert_array_equal(result.peak_weights, serial.peak_weights)
+        for actual, expected in zip(result.grainsinos, serial.grainsinos):
+            np.testing.assert_array_equal(actual.spatial_split_mask, expected.spatial_split_mask)
+            np.testing.assert_array_equal(actual.recons["iradon"], expected.recons["iradon"])
+        monkeypatch.setattr(sino, "_refine_rebuild_sinogram", rebuild)
         monkeypatch.setattr(sino, "_refine_reconstruction_mask", lambda *args: None)
         _, full = sino.refine_grain_sinograms(ds, grains, **options)
+    for name, values in columns.items():
+        np.testing.assert_array_equal(cf[name], values)
+    np.testing.assert_array_equal(options["initial_weights"], weights * budget[:, None])
     active = result.peak_weights.sum(axis=1) > 0
-    assert active.any() and result.history
+    assert active.any()
+    assert len(result.history) == len(serial.history)
+    assert bool(result.history) == bool(iterations)
     np.testing.assert_allclose(result.peak_weights[active].sum(axis=1), .8)
     assert np.all(result.peak_weights >= 0)
     np.testing.assert_allclose(result.peak_weights, full.peak_weights, atol=1e-12)
@@ -117,3 +148,9 @@ def test_feedback_conserves_budget_and_matches_full_backprojection(monkeypatch):
         np.testing.assert_array_equal(gs.spatial_split_mask, full.grainsinos[k].spatial_split_mask)
         np.testing.assert_allclose(gs.recons["iradon"], full.grainsinos[k].recons["iradon"])
         np.testing.assert_array_equal(updated[k].ubi, grains[k].ubi)
+
+
+@pytest.mark.parametrize("workers", [0, -1, 1.5, True, np.bool_(True)])
+def test_refinement_rejects_invalid_workers(workers):
+    with pytest.raises(ValueError, match="workers must be a positive integer"):
+        sino.refine_grain_sinograms(None, [], workers=workers)
