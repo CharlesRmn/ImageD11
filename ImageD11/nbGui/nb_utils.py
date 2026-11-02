@@ -779,7 +779,7 @@ def plot_sinograms_hough(colfile, y0, radius=None, bins=257,
     is twice max(abs(dty - y0)) for the finite selected peaks. bins is the
     number of grid centres on each axis. Every finite selected peak votes,
     without intensity weighting, thresholding or angular rebinning. Votes use
-    the same rasterization and geometric correction as the Hough initializer.
+    linear rasterization with a geometric correction for the chosen grid axis.
     The accumulator is displayed as log1p(votes), without smoothing.
     spatial_mask optionally supplies a (bins, bins) mask in displayed image
     order: rows are sample y, columns sample x, with origin at the lower left.
@@ -789,7 +789,7 @@ def plot_sinograms_hough(colfile, y0, radius=None, bins=257,
     or voting. Inputs are unchanged.
     Returns (fig, axes); does not show the figure or modify the table.
     """
-    from ImageD11.sinograms.sinogram import _refine_design, _decouple_hough_votes
+    from ImageD11.sinograms.sinogram import _refine_design, _hough_votes
 
     if not np.isscalar(y0) or not np.isfinite(y0):
         raise ValueError("Supply a finite scalar calibrated y0")
@@ -813,7 +813,7 @@ def plot_sinograms_hough(colfile, y0, radius=None, bins=257,
     if not np.isscalar(radius) or not np.isfinite(radius) or radius <= 0:
         raise ValueError("Supply a positive finite radius")
     spacing = 2.0 * radius / (bins - 1)
-    votes = _decouple_hough_votes(
+    votes = _hough_votes(
         _refine_design(omega), target, np.ones(len(omega)),
         np.array([-radius, -radius]), spacing, int(bins))
 
@@ -855,7 +855,7 @@ def hough_grain_picker(cf, y0, radius, bins=409, spatial_mask=None):
     from IPython.display import display
     from scipy.ndimage import gaussian_filter
     from skimage.feature import peak_local_max
-    from ImageD11.sinograms.sinogram import _refine_design, _decouple_hough_votes
+    from ImageD11.sinograms.sinogram import _refine_design, _hough_votes
 
     if not np.isfinite(radius) or radius <= 0 or not np.isfinite(y0):
         raise ValueError("Supply a positive finite radius and calibrated finite y0")
@@ -872,7 +872,7 @@ def hough_grain_picker(cf, y0, radius, bins=409, spatial_mask=None):
         raise ValueError("No finite unassigned peaks")
     omega, dty = np.mod(cf.omega[rows], 360), cf.dty[rows].copy()
     spacing = 2.0 * radius / (bins - 1)
-    votes = _decouple_hough_votes(
+    votes = _hough_votes(
         _refine_design(omega), dty - y0, np.ones(len(rows)),
         np.array([-radius, -radius]), spacing, int(bins)).T
     state = dict(cf=cf, rows=rows, omega=omega, dty=dty, y0=y0,
@@ -1103,43 +1103,6 @@ def plot_grainsino_grid(grainsinos, n_grains_to_plot=None):
     return fig
 
 
-def report_spatial_components(diagnostics, plot=True):
-    """Report initial region selection; density refers to reconstructed image values."""
-    regions = diagnostics["regions"]
-    selected = diagnostics["selected_region_ids"]
-    excluded = diagnostics["excluded_region_ids"]
-    print("Spatial regions: kept {} of {}; excluded {} ({} pixels, {:.6g} reconstructed density).".format(
-        len(selected), diagnostics["found"], len(excluded),
-        diagnostics["excluded_pixels"], diagnostics["excluded_density"]))
-    print("  region | pixels | reconstructed density | selection")
-    for region in regions:
-        print("  {} | {} | {:.6g} | {}".format(
-            region["region_id"], region["pixels"], region["density_sum"],
-            "kept" if region["selected"] else "excluded"))
-    if not plot:
-        return []
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), constrained_layout=True)
-    fig.suptitle("Initial spatial regions: {} kept, {} excluded".format(len(selected), len(excluded)))
-    labels = diagnostics["labels"]
-    axes[0].imshow(diagnostics["image"], origin="lower")
-    axes[0].set_title("Parent reconstruction (smoothed)")
-    axes[1].imshow(np.ma.masked_where(labels == 0, labels), origin="lower", cmap="tab20")
-    axes[1].set_title("Threshold regions; red = retained")
-    for label_id in selected:
-        mask = labels == label_id
-        axes[1].contour(mask, levels=[.5], colors=["red"])
-        row, col = np.mean(np.column_stack(np.nonzero(mask)), axis=0)
-        axes[1].text(col, row, str(label_id), color="red", ha="center")
-    x = np.arange(len(regions))
-    axes[2].bar(x, [r["pixels"] for r in regions],
-                color=["tab:red" if r["selected"] else ".7" for r in regions])
-    axes[2].set_yscale("log")
-    axes[2].set(xticks=x, xticklabels=[r["region_id"] for r in regions],
-                xlabel="Region ID (ranked by pixel area)", ylabel="Pixels", title="Region sizes")
-    axes[2].tick_params(axis="x", labelrotation=90, labelsize=8)
-    return [fig]
-
-
 def report_sinogram_refinement(result, max_grains=4, plot=True):
     """Print measured refinement diagnostics and return report figures.
 
@@ -1151,8 +1114,6 @@ def report_sinogram_refinement(result, max_grains=4, plot=True):
     if (isinstance(max_grains, (bool, np.bool_))
             or not isinstance(max_grains, (int, np.integer)) or max_grains < 0):
         raise ValueError("max_grains must be a nonnegative integer")
-    spatial = getattr(result, "spatial_component_diagnostics", None)
-    spatial_figures = report_spatial_components(spatial, plot=plot) if spatial else []
     stats = result.stats
     history = result.history
     status = ("initialization only" if not history else
@@ -1177,7 +1138,7 @@ def report_sinogram_refinement(result, max_grains=4, plot=True):
         print("  {} | {} | {} | {} | {} | {}".format(gid, *values))
     if not plot:
         return []
-    figures = spatial_figures
+    figures = []
     fig, axes = plt.subplots(2, 3, figsize=(16, 8), constrained_layout=True)
     fig.suptitle("Sinogram refinement: {}".format(status))
     x = np.arange(len(ids))
@@ -1236,59 +1197,6 @@ def report_sinogram_refinement(result, max_grains=4, plot=True):
         fig.colorbar(points, ax=axes[2], label="Assigned intensity fraction")
         axes[2].set(xlabel="omega modulo 360 (degrees)", ylabel="dty",
                     title="Assignments ({} of {} candidate rows)".format(len(rows), len(result.source_2d_rows)))
-        figures.append(fig)
-    return figures
-
-
-def plot_decoupled_sinograms(results):
-    """Plot full fractional sinograms, spatial supports, and convergence."""
-    figures = []
-    for result in results:
-        fig, axes = plt.subplots(len(result.grainsinos), 4,
-                                 figsize=(18, 4 * len(result.grainsinos)), squeeze=False)
-        for k, gs in enumerate(result.grainsinos):
-            axes[k, 0].pcolormesh(
-                gs.sinoangles, gs.ds.ybincens, gs.ssino, shading="auto"
-            )
-            axes[k, 0].set(
-                title="Grain {}: split sinogram".format(
-                    result.child_ids[k] if result.child_ids else k
-                ),
-                xlabel="omega (degrees)",
-                ylabel="dty",
-            )
-            axes[k, 1].imshow(gs.recons["iradon"], origin="lower", vmin=0)
-            axes[k, 1].contour(gs.spatial_split_mask, levels=[0.5], colors=["red"])
-            axes[k, 1].set_title("Reconstruction and spatial support")
-            rows = result.source_2d_rows
-            used = result.peak_weights[:, k] > 0
-            axes[k, 2].scatter(
-                gs.ds.pk2d["omega"][rows[~used]],
-                gs.ds.pk2d["dty"][rows[~used]],
-                s=2,
-                color="0.8",
-            )
-            points = axes[k, 2].scatter(
-                gs.ds.pk2d["omega"][rows[used]],
-                gs.ds.pk2d["dty"][rows[used]],
-                s=3,
-                c=result.peak_weights[used, k],
-                cmap="viridis",
-                vmin=0,
-                vmax=1,
-            )
-            fig.colorbar(points, ax=axes[k, 2], label="Intensity fraction")
-            axes[k, 2].set(
-                title="Exclusive and shared contributions", xlabel="omega", ylabel="dty"
-            )
-            history = result.history
-            if history:
-                key = "weight_change" if k == 0 else "retained_intensity"
-                axes[k, 3].plot(
-                    [h["iteration"] for h in history], [h[key] for h in history], "o-"
-                )
-                axes[k, 3].set(xlabel="iteration", ylabel=key.replace("_", " "))
-        fig.tight_layout()
         figures.append(fig)
     return figures
 

@@ -17,7 +17,7 @@ from scipy.optimize import least_squares
 from tqdm.auto import tqdm
 from scipy.ndimage import (
     binary_dilation, binary_fill_holes, gaussian_filter,
-    gaussian_filter1d, label as ndi_label,
+    label as ndi_label,
 )
 
 import ImageD11.grain
@@ -94,7 +94,7 @@ class GrainSinogram:
         self.recon_shift = None
         self.recon_niter = None
         self.recon_y0 = None
-        # Optional fractional assignment from peak refinement or spatial/twin splitting.
+        # Optional fractional assignment from peak refinement.
         self.source_2d_rows = None
         self.peak_fractions = None
         self.spatial_split_mask = None
@@ -106,16 +106,12 @@ class GrainSinogram:
         Returns False when no matching saved assignment exists. No peak geometry
         is computed here.
         """
-        assignment = _saved_split_assignment(self, grain_label, phase_name)
+        assignment = _saved_peak_assignment(self, grain_label, phase_name)
         if assignment is None:
             return False
         self.source_2d_rows, self.peak_fractions = assignment
         self.grain.npks_4d = len(np.unique(self.ds.pk2d['spot3d_id'][self.source_2d_rows]))
         return True
-
-    def load_saved_split(self, grain_label, phase_name=None):
-        """Compatibility name for restoring split or refined peak assignments."""
-        return self.load_saved_peak_assignment(grain_label, phase_name)
 
 
     def prepare_peaks_from_2d(self, cf_2d, grain_label, hkltol=0.25, gv=None):
@@ -145,7 +141,7 @@ class GrainSinogram:
             raise ValueError("Intensity fractions must be in [0, 1]")
         keep = weights > 0
         if keep.sum() < 20:
-            raise ValueError("Too few contributing peaks to reconstruct this child")
+            raise ValueError("Too few contributing peaks to reconstruct this grain")
         cf = cf_2d.copyrows(keep)
         cf.addcolumn(cf.sum_intensity * weights[keep], "sum_intensity")
         self.cf_for_sino = cf
@@ -162,14 +158,14 @@ class GrainSinogram:
             self.peak_fractions = weights[keep].copy()
 
     def prepare_peaks_from_4d(self, cf_4d, gord, inds, grain_label, spatial_corrector, hkltol=0.25,
-                              phase_name=None, use_saved_split=True):
+                              phase_name=None, use_saved_assignments=True):
         """Subset THIS grain's 2D peaks out of ds.pk2d, spatially correct and add
         geometry on that subset only, then compute/store hkl and apply hkl tolerance.
         Never materialises a global cf_2d."""
 
         # Saved fractional assignments take precedence over orientation-only labels.
-        if use_saved_split:
-            assignment = _saved_split_assignment(self, grain_label, phase_name)
+        if use_saved_assignments:
+            assignment = _saved_peak_assignment(self, grain_label, phase_name)
             if assignment is not None:
                 rows, fractions = assignment
                 flt = _refine_colfile_from_rows(self.ds, rows, cf_4d.parameters)
@@ -306,9 +302,9 @@ class GrainSinogram:
     def update_lab_position_from_peaks(self, cf_4d, grain_label, y0_guess, phase_name=None):
         """Updates translation of self.grain using peaks in assigned 4D colfile.
         Also updates self.recon_y0 with centre"""
-        # Spatial split centres and y0 are already saved. Orientation-only
-        # assignment in tomo_2_map may give the appended child zero 4D peaks.
-        if self.load_saved_split(grain_label, phase_name):
+        # Saved refinements already contain centres and y0. Orientation-only
+        # assignment in tomo_2_map may give a refined grain zero 4D peaks.
+        if self.load_saved_peak_assignment(grain_label, phase_name):
             return
         mask_4d = cf_4d.grain_id == grain_label
         omega = cf_4d.omega[mask_4d]
@@ -1117,7 +1113,7 @@ def get_2d_peaks_from_4d_peaks(p2d, cf, return_labels=False):
     return gord, inds
 
 
-# Grain peak refinement, spatial decoupling and twin-aware peak sharing.
+# Grain peak refinement and fractional peak sharing.
 def _refine_group_rows(values):
     """Sort once and reuse contiguous angle/reflection groups during feedback."""
     order = np.argsort(values, kind="stable")
@@ -1189,32 +1185,6 @@ def _refine_project_kernel(
     return profile, support
 
 
-def _refine_mask_geometry(shape, centre, ystep, radius):
-    ri = np.arange(shape[0])[:, None]
-    rj = np.arange(shape[1])[None, :]
-    sx, sy = recon_to_sample(ri, rj, shape, ystep)
-    distances = (sx - centre[0]) ** 2 + (sy - centre[1]) ** 2
-    return distances <= radius**2, distances
-
-
-def _refine_reconstruction_mask(roi, shift, ny):
-    """Restrict feedback backprojection without changing boundary interpolation."""
-    # gaussian_filter(..., 1) has a four-pixel radius on each axis.
-    mask = binary_dilation(roi, structure=np.ones((9, 9), dtype=bool))
-    if abs(shift) >= 1:
-        # Native iradon zero-pads projection shifts. Larger shifts can make
-        # its interpolation grid nonmonotonic at the detector boundaries,
-        # where np.interp's result depends on the sequence of queried pixels.
-        # Restrict acceleration to pixels projecting strictly inside those
-        # boundaries, or retain the original full-image query sequence.
-        ri, rj = np.nonzero(mask)
-        centre = roi.shape[0] // 2
-        distance = (ri - centre) ** 2 + (rj - centre) ** 2
-        if distance.size and distance.max() >= ((ny - 1) // 2) ** 2:
-            return None
-    return mask
-
-
 def _refine_design(omega):
     a = np.deg2rad(omega)
     return np.column_stack((-np.sin(a), -np.cos(a)))
@@ -1224,125 +1194,8 @@ def _refine_predict(omega, centres, y0):
     return _refine_design(omega) @ np.asarray(centres).T + y0
 
 
-def _decouple_classify(omega, dty, centres, y0, width, margin):
-    distances = np.abs(np.asarray(dty)[:, None] - _refine_predict(omega, centres, y0))
-    nearest = distances.argmin(axis=1)
-    ordered = np.sort(distances, axis=1)
-    separation = ordered[:, 1] - ordered[:, 0] if len(centres) > 1 else np.full(len(dty), np.inf)
-    confident = (ordered[:, 0] <= width) & (separation >= margin)
-    return (np.where(confident, nearest, -1), distances)
-
-
-def _decouple_ransac_one_manual(omega, dty, width, rng, trials, fixed_y0=None):
-    """Legacy scalar, fixed-trial initializer for the opt-in trajectory mode."""
-    X = _refine_design(omega)
-    A = np.column_stack((X, np.ones(len(X)))) if fixed_y0 is None else X
-    target = dty if fixed_y0 is None else dty - fixed_y0
-    npars = A.shape[1]
-    if len(target) < max(8, npars):
-        raise ValueError("Too few residual peaks for the second trajectory")
-    best = None
-    best_score = -np.inf
-    for _ in range(trials):
-        ix = rng.choice(len(target), npars, replace=False)
-        if np.linalg.cond(A[ix]) > 50:
-            continue
-        beta = np.linalg.lstsq(A[ix], target[ix], rcond=None)[0]
-        residual = np.abs(np.dot(A, beta) - target)
-        inside = residual < width
-        bins = np.floor(np.mod(omega[inside], 360) / 15).astype(int)
-        score = inside.sum() * min(len(np.unique(bins)), 12) / 12
-        if score > best_score:
-            best, best_score = (beta, score)
-    if best is None:
-        raise RuntimeError("RANSAC failed; check angular coverage")
-    inside = np.abs(np.dot(A, best) - target) < width
-    fit = least_squares(
-        lambda b: np.dot(A[inside], b) - target[inside],
-        best,
-        loss="soft_l1",
-        f_scale=width / 2,
-    )
-    beta = fit.x
-    y0 = beta[2] if fixed_y0 is None else fixed_y0
-    return (beta[:2], y0)
-
-
-def _decouple_ransac_one(omega, dty, width, rng, trials, fixed_y0=None, min_angle_bins=0, confidence=None):
-    """Fit a trajectory with optional nominal-confidence adaptive sampling."""
-    if confidence is not None and not 0 < confidence < 1:
-        raise ValueError("RANSAC confidence must be between zero and one, or None")
-    X = _refine_design(omega)
-    A = np.column_stack((X, np.ones(len(X)))) if fixed_y0 is None else X
-    target = dty if fixed_y0 is None else dty - fixed_y0
-    npars = A.shape[1]
-    if len(target) < max(8, npars):
-        raise ValueError("Too few residual peaks for the second trajectory")
-    sectors = np.floor(np.mod(omega, 360) / 15).astype(int)
-    order = np.argsort(sectors)
-    boundaries = np.r_[0, np.flatnonzero(np.diff(sectors[order])) + 1]
-    if len(boundaries) < min_angle_bins:
-        raise RuntimeError("Residual signal has insufficient angular coverage")
-    # Bound each scoring float matrix to 1 MiB (or one observation vector).
-    block = max(1, min(64, 131072 // len(target)))
-    best = None
-    best_score = -np.inf
-    best_hits = 0
-    upper_score = len(target) * min(len(boundaries), 12) / 12.0
-    drawn, limit = 0, trials
-    while drawn < limit:
-        # Fixed mode consumes the historical full RNG stream. Adaptive mode
-        # draws small batches so successful tracks avoid further sampling.
-        batch = trials if confidence is None else min(32, limit - drawn)
-        samples = np.asarray([rng.choice(len(target), npars, replace=False)
-                              for _ in range(batch)], dtype=int).reshape(-1, npars)
-        drawn += batch
-        matrices = A[samples]
-        good = np.linalg.cond(matrices) <= 50
-        betas = np.linalg.solve(matrices[good], target[samples[good]][:, :, None])[:, :, 0]
-        for start in range(0, len(betas), block):
-            trial_betas = betas[start:start + block]
-            inside = np.abs(np.dot(A, trial_betas.T) - target[:, None]) < width
-            coverage = np.count_nonzero(
-                np.logical_or.reduceat(inside[order], boundaries, axis=0), axis=0)
-            hits = inside.sum(axis=0)
-            scores = hits * np.minimum(coverage, 12) / 12.0
-            scores[coverage < min_angle_bins] = -np.inf
-            winner = int(np.argmax(scores))
-            if scores[winner] > best_score:
-                best = trial_betas[winner]
-                best_score = scores[winner]
-                best_hits = int(hits[winner])
-            if best_score == upper_score:
-                break
-        if confidence is None:
-            break
-        if best is not None and best_hits >= npars:
-            # Exact probability of drawing an all-inlier minimal sample
-            # without replacement; confidence is the nominal RANSAC target.
-            offsets = np.arange(npars, dtype=float)
-            probability = np.prod((best_hits - offsets) / (len(target) - offsets))
-            if probability >= 1:
-                limit = drawn
-            elif probability > 0:
-                needed = int(np.ceil(np.log1p(-confidence) / np.log1p(-probability)))
-                limit = min(trials, max(drawn, needed))
-    if best is None:
-        raise RuntimeError("RANSAC failed; check angular coverage")
-    inside = np.abs(A @ best - target) < width
-    fit = least_squares(
-        lambda b: A[inside] @ b - target[inside],
-        best,
-        loss="soft_l1",
-        f_scale=width / 2,
-    )
-    beta = fit.x
-    y0 = beta[2] if fixed_y0 is None else fixed_y0
-    return (beta[:2], y0)
-
-
 @numba.njit
-def _decouple_hough_votes(design, target, weights, lower, spacing, size):
+def _hough_votes(design, target, weights, lower, spacing, size):
     """Rasterize a*x+b*y=target without dividing by a small coefficient."""
     votes = np.zeros((size, size), dtype=np.float64)
     for row in range(len(target)):
@@ -1370,442 +1223,85 @@ def _decouple_hough_votes(design, target, weights, lower, spacing, size):
     return votes
 
 
-def _decouple_hough_one(omega, dty, width, fixed_y0, min_angle_bins=0):
-    """Seed a robust trajectory fit using sector-balanced sample-space votes.
-
-    A fixed 129-square grid is refined around its maximum until the spacing
-    is at most width/2. Each occupied 15-degree sector has unit total weight.
-    Only the grid, not a peak-by-grid matrix, is allocated for voting.
-    """
-    if fixed_y0 is None or not np.isfinite(fixed_y0):
-        raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
-    if not np.isfinite(width) or width <= 0:
-        raise ValueError("Hough trajectory width must be positive and finite")
-    if len(dty) < 8:
-        raise ValueError("Too few residual peaks for a Hough trajectory")
-    design = _refine_design(np.mod(omega, 360))
-    if np.linalg.matrix_rank(design) < 2:
-        raise RuntimeError("Hough initialization needs distinct projection directions")
-    target = np.asarray(dty) - fixed_y0
-    sectors = np.floor(np.mod(omega, 360) / 15).astype(int)
-    counts = np.bincount(sectors, minlength=24)
-    weights = 1.0 / counts[sectors]
-    centre = np.zeros(2)
-    radius = 2 * max(width, np.max(np.abs(target)))
-    size = 129
-    while True:
-        lower = centre - radius
-        spacing = 2 * radius / (size - 1)
-        votes = _decouple_hough_votes(design, target, weights, lower, spacing, size)
-        votes = gaussian_filter(votes, max(.75, width / spacing), mode="constant")
-        peak = np.asarray(np.unravel_index(np.argmax(votes), votes.shape))
-        centre = lower + spacing * peak
-        if spacing <= width / 2:
-            break
-        radius = 4 * spacing
-    inside = np.abs(np.dot(design, centre) - target) < width
-    if inside.sum() < 8 or len(np.unique(sectors[inside])) < min_angle_bins:
-        raise RuntimeError("Hough maximum has insufficient angular support")
-    fit = least_squares(
-        lambda c: np.dot(design[inside], c) - target[inside], centre,
-        loss="soft_l1", f_scale=width / 2,
-    )
-    return fit.x, float(fixed_y0)
-
-
-def _decouple_fit_components(omega, dty, width, margin, fixed_y0=None, trials=600, seed=42, n_components=2, min_angle_bins=0, confidence=None, hough=False):
-    omega, dty = (np.asarray(omega), np.asarray(dty))
-    if width <= 0 or margin < 0 or len(omega) != len(dty):
-        raise ValueError("Invalid trajectory fitting inputs")
-    if not np.isfinite(omega).all() or not np.isfinite(dty).all():
-        raise ValueError("Trajectory fitting requires finite observations")
-    X = _refine_design(omega)
-    manual = min_angle_bins == 0 and confidence is None
-    if hough:
-        if fixed_y0 is None or not np.isfinite(fixed_y0):
-            raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
-    elif manual and hasattr(np.random, "Generator"):
-        # The pre-automation manual initializer used the PCG64 stream.
-        rng = np.random.Generator(np.random.PCG64(seed))
-    else:
-        rng = np.random.RandomState(seed)
-
-    def fit_one(angles, values, offset):
-        if hough:
-            return _decouple_hough_one(angles, values, width, offset, min_angle_bins)
-        if manual:
-            return _decouple_ransac_one_manual(angles, values, width, rng, trials, offset)
-        return _decouple_ransac_one(
-            angles, values, width, rng, trials, offset, min_angle_bins, confidence)
-
-    candidates = []
-    angular_bins = np.floor(np.mod(omega, 360) / 15).astype(int)
-
-    def supported(labels):
-        return all(np.sum(labels == k) >= 8
-                   and len(np.unique(angular_bins[labels == k])) >= min_angle_bins
-                   for k in range(n_components))
-
-    for _ in range(1 if hough else 8):
-        c1, offset = fit_one(omega, dty, fixed_y0)
-        centres = [c1]
-        for component in range(1, n_components):
-            distances = np.abs(dty[:, None] - _refine_predict(omega, centres, offset))
-            remaining = distances.min(axis=1) > width
-            try:
-                centre, _ = fit_one(omega[remaining], dty[remaining], offset)
-            except (ValueError, RuntimeError):
-                break
-            centres.append(centre)
-        if len(centres) != n_components:
-            continue
-        centres = np.asarray(centres)
-        previous = None
-        for iteration in range(30):
-            labels, distances = _decouple_classify(
-                omega, dty, centres, offset, width, margin
-            )
-            keep = labels >= 0
-            if not supported(labels):
-                break
-            if previous is not None and np.array_equal(labels, previous):
-                break
-            previous = labels.copy()
-            initial = (
-                centres.ravel()
-                if fixed_y0 is not None
-                else np.r_[centres.ravel(), offset]
-            )
-
-            def residual(p):
-                cc = p[:2 * n_components].reshape(n_components, 2)
-                yy = fixed_y0 if fixed_y0 is not None else p[2 * n_components]
-                return np.sum(X[keep] * cc[labels[keep]], axis=1) + yy - dty[keep]
-
-            result = least_squares(residual, initial, loss="soft_l1", f_scale=width / 2)
-            centres = result.x[:2 * n_components].reshape(n_components, 2)
-            offset = fixed_y0 if fixed_y0 is not None else result.x[2 * n_components]
-        labels, distances = _decouple_classify(
-            omega, dty, centres, offset, width, margin
-        )
-        if not supported(labels):
-            continue
-        score = np.mean(np.minimum(distances.min(axis=1) ** 2, width**2))
-        candidates.append((score, centres.copy(), float(offset), labels))
-    if not candidates:
-        raise RuntimeError(
-            "Requested component count is not supported by the peaks. Inspect branches and adjust WIDTH/Y0."
-        )
-    _, centres, offset, labels = min(candidates, key=lambda item: item[0])
-    order = np.lexsort((centres[:, 1], centres[:, 0]))
-    centres = centres[order]
-    labels, _ = _decouple_classify(omega, dty, centres, offset, width, margin)
-    return (centres, offset, labels)
-
-
-def _decouple_validation_losses(train_omega, train_dty, omega, dty,
-                                centres, y0, width):
-    """Score held-out peaks using normalized, width-aware track densities.
-
-    Training nearest-track assignments estimate component weights and RMS
-    widths. The scale floor is the existing robust fit scale, width / 2.
-    Return likelihood loss and the legacy capped-distance loss separately.
-    """
-    train_residual = train_dty[:, None] - _refine_predict(train_omega, centres, y0)
-    nearest = np.abs(train_residual).argmin(axis=1)
-    residual = dty[:, None] - _refine_predict(omega, centres, y0)
-    log_density = np.full(residual.shape, -np.inf)
-    for k in range(len(centres)):
-        values = train_residual[nearest == k, k]
-        if not len(values):
-            continue
-        scale = max(width / 2.0, np.sqrt(np.mean(values ** 2)))
-        weight = float(len(values)) / len(train_dty)
-        log_density[:, k] = (np.log(weight) - np.log(scale * np.sqrt(2 * np.pi))
-                             - 0.5 * (residual[:, k] / scale) ** 2)
-    likelihood = -np.logaddexp.reduce(log_density, axis=1)
-    distance = np.minimum(np.abs(residual).min(axis=1) / width, 1.0) ** 2
-    return likelihood, distance
-
-
-def _decouple_auto_components(omega, dty, width, margin, fixed_y0=None,
-                             trials=600, seed=42, max_components=4, confidence=0.999, hough=False):
-    """Select trajectories by blocked angular prediction and a one-SE rule.
-
-    Selection uses normalized Gaussian mixture likelihoods with branch widths
-    learned on training angles. Legacy capped-distance scores remain in diagnostics.
-    Each fold holds out 30-degree sectors, including all repeated turns at those
-    angles. Each full-data track needs 180 degrees of support (12 occupied
-    15-degree sectors); each two-thirds training fold needs eight sectors.
-    Returned diagnostics describe candidate counts, not a probability of grains.
-    """
-    if confidence is not None and not 0 < confidence < 1:
-        raise ValueError("RANSAC confidence must be between zero and one, or None")
-    if hough and (fixed_y0 is None or not np.isfinite(fixed_y0)):
-        raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
-    if (isinstance(max_components, (bool, np.bool_))
-            or not isinstance(max_components, (int, np.integer)) or max_components < 1):
-        raise ValueError("max_components must be a positive integer")
-    max_components = min(max_components, 4)
-    omega, dty = np.asarray(omega), np.asarray(dty)
-    if (omega.ndim != 1 or dty.shape != omega.shape or len(omega) < 24
-            or width <= 0 or margin < 0
-            or not np.isfinite(omega).all() or not np.isfinite(dty).all()):
-        raise ValueError("Automatic counting needs at least 24 finite omega/dty pairs")
-    sectors = np.floor(np.mod(omega, 360) / 30).astype(int)
-    occupied = np.unique(sectors)
-    if len(np.unique(np.floor(np.mod(omega, 360) / 15).astype(int))) < 12:
-        raise ValueError("Automatic counting needs at least 180 degrees of support (12 occupied 15-degree sectors)")
-    # Assign occupied angular blocks, rather than observations, to validation folds.
-    fold_of_sector = np.zeros(12, dtype=int)
-    fold_of_sector[occupied] = np.arange(len(occupied)) % 3
-    folds = fold_of_sector[sectors]
-    fine_sectors = np.floor(np.mod(omega, 360) / 15).astype(int)
-    fits, losses, legacy_losses, counts, penalties, legacy_penalties = [], [], [], [], [], []
-    fit_options = dict(hough=True) if hough else {}
-
-    def supported(labels, angles, count, minimum_bins):
-        return all(np.sum(labels == k) >= 8
-                   and len(np.unique(angles[labels == k])) >= minimum_bins
-                   for k in range(count))
-
-    for count in range(1, min(max_components, len(omega) // 8) + 1):
-        try:
-            fit = _decouple_fit_components(
-                omega, dty, width, margin, fixed_y0, trials, seed, count, min_angle_bins=12, confidence=confidence, **fit_options)
-            if not supported(fit[2], fine_sectors, count, 12):
-                raise RuntimeError("Insufficient angular support for fitted tracks")
-            heldout = np.empty(len(omega))
-            legacy_heldout = np.empty(len(omega))
-            for fold in range(3):
-                train = folds != fold
-                centres, offset, labels = _decouple_fit_components(
-                    omega[train], dty[train], width, margin, fixed_y0,
-                    trials, seed + fold + 1, count, min_angle_bins=8, confidence=confidence, **fit_options)
-                if not supported(labels, fine_sectors[train], count, 8):
-                    raise RuntimeError("Insufficient angular support in a training fold")
-                heldout[~train], legacy_heldout[~train] = _decouple_validation_losses(
-                    omega[train], dty[train], omega[~train], dty[~train],
-                    centres, offset, width)
-        except (ValueError, RuntimeError):
-            if count == 1:
-                raise RuntimeError("Automatic counting could not validate one trajectory; check WIDTH/Y0 and angular coverage")
-            break
-        fits.append(fit)
-        counts.append(count)
-        losses.append(np.array([heldout[sectors == b].mean() for b in occupied]))
-        legacy_losses.append(np.array([legacy_heldout[sectors == b].mean() for b in occupied]))
-        # Two centre coordinates and one width per track, count - 1 weights,
-        # and the shared rotation-axis offset when it is not fixed.
-        parameters = 4 * count - 1 + int(fixed_y0 is None)
-        penalties.append(0.5 * parameters * np.log(len(omega)) / len(omega))
-        legacy_parameters = 2 * count + int(fixed_y0 is None)
-        legacy_penalties.append(legacy_parameters * np.log(len(omega)) / len(omega))
-    losses = np.asarray(losses)
-    scores = losses.mean(axis=1) + penalties
-    best = int(np.argmin(scores))
-    standard_error = losses[best].std(ddof=1) / np.sqrt(len(occupied))
-    chosen = int(np.flatnonzero(scores <= scores[best] + standard_error)[0])
-    legacy_losses = np.asarray(legacy_losses)
-    legacy_scores = legacy_losses.mean(axis=1) + legacy_penalties
-    legacy_best = int(np.argmin(legacy_scores))
-    diagnostics = dict(
-        counts=counts, scores=legacy_scores.tolist(), selected=counts[chosen],
-        standard_error=float(legacy_losses[legacy_best].std(ddof=1) / np.sqrt(len(occupied))),
-        selection_scores=scores.tolist(), selection_standard_error=float(standard_error),
-        selection_method="normalized Gaussian mixture likelihood", minimum_angle_coverage=180,
-        ransac_confidence=None if hough else confidence,
-        ambiguous=int(np.sum(scores <= scores[best] + standard_error)) > 1,
-        reached_limit=counts[chosen] == max_components and max_components < 4,
-    )
-    centres, offset, labels = fits[chosen]
-    return centres, offset, labels, diagnostics
-
-
-def _decouple_fit_two(omega, dty, width, margin, fixed_y0=None, trials=600, seed=42):
-    return _decouple_fit_components(omega, dty, width, margin, fixed_y0, trials, seed)
-
-
-def _decouple_select_full_branches(
-    omega,
-    dty,
-    centres,
-    y0,
-    step,
-    fit_width,
-    margin,
-    manual_width=None,
-    angle_bin=10,
-    density_fraction=0.08,
-):
-    """Learn connected density envelopes in resolved angles; reject overlap."""
-    from scipy.ndimage import gaussian_filter1d
-
-    omega, dty = (np.asarray(omega), np.asarray(dty))
-    if step <= 0 or not 0 < angle_bin <= 180 or (not 0 < density_fraction < 1):
-        raise ValueError("Check step, ANGLE_BIN_2D and DENSITY_FRACTION_2D")
-    trajectories = _refine_predict(omega, centres, y0)
-    residuals = dty[:, None] - trajectories
-    n_components = len(centres)
-    nearest = np.abs(residuals).argmin(axis=1)
-    separation = np.full(len(omega), np.inf)
-    nearest_trajectory = trajectories[np.arange(len(omega)), nearest]
-    for k in range(n_components):
-        distance = np.abs(trajectories[:, k] - nearest_trajectory)
-        distance[nearest == k] = np.inf
-        np.minimum(separation, distance, out=separation)
-    resolved = separation > max(6 * step, 4 * fit_width)
-    nbins = int(np.ceil(360 / angle_bin))
-    bin_centres = (np.arange(nbins) + 0.5) * 360 / nbins
-    bin_ids = np.floor(np.mod(omega, 360) * nbins / 360).astype(int)
-    widths = np.full((nbins, n_components, 2), np.nan)
-    if manual_width is None:
-        search = (max(6 * step, 0.45 * np.max(separation)) if n_components > 1
-                  else max(6 * step, 2 * fit_width, np.percentile(np.abs(residuals), 95)))
-        edges = np.arange(-search, search + step, step)
-        mids = (edges[:-1] + edges[1:]) / 2
-        for b in range(nbins):
-            for k in range(n_components):
-                m = (bin_ids == b) & resolved & (nearest == k)
-                if m.sum() < 15:
-                    continue
-                values = residuals[m, k]
-                hist = gaussian_filter1d(
-                    np.histogram(values, edges)[0].astype(float), 1
-                )
-                near = np.flatnonzero(np.abs(mids) <= max(fit_width, 2 * step))
-                peak = near[np.argmax(hist[near])]
-                if hist[peak] <= 0:
-                    continue
-                threshold = max(1.0, density_fraction * hist[peak])
-                lo = hi = peak
-                while lo > 0 and hist[lo - 1] >= threshold:
-                    lo -= 1
-                while hi < len(hist) - 1 and hist[hi + 1] >= threshold:
-                    hi += 1
-                widths[b, k] = [max(2 * step, -edges[lo]), max(2 * step, edges[hi + 1])]
-        for k in range(n_components):
-            valid = np.isfinite(widths[:, k, 0])
-            if valid.sum() < 3:
-                raise RuntimeError(
-                    "Too few resolved angle bins to learn envelopes for child {}: "
-                    "{} usable bins (need at least 3), {} resolved 2D peaks. "
-                    "Maximum sampled branch separation is {:.3g} dty steps; "
-                    "automatic estimation requires more than {:.3g} steps. "
-                    "Supply width_2d (branch half-width in dty units), or increase "
-                    "angle_bin if resolved peaks are spread too sparsely. "
-                    "Increasing angle_bin cannot resolve overlapping branches.".format(
-                        k,
-                        int(valid.sum()),
-                        int(np.sum(resolved & (nearest == k))),
-                        separation.max() / step,
-                        max(6 * step, 4 * fit_width) / step,
-                    )
-                )
-            for side in (0, 1):
-                widths[:, k, side] = np.interp(
-                    bin_centres, bin_centres[valid], widths[valid, k, side], period=360
-                )
-    else:
-        if manual_width <= 0:
-            raise ValueError("WIDTH_2D must be positive")
-        widths[:] = manual_width
-    per_peak = np.empty((len(omega), n_components, 2))
-    for k in range(n_components):
-        for side in (0, 1):
-            per_peak[:, k, side] = np.interp(
-                np.mod(omega, 360), bin_centres, widths[:, k, side], period=360
-            )
-    supports = (residuals >= -per_peak[:, :, 0]) & (residuals <= per_peak[:, :, 1])
-    labels = np.full(len(omega), -1, dtype=int)
-    exclusive = supports.sum(axis=1) == 1
-    ordered = np.sort(np.abs(residuals), axis=1)
-    safe = exclusive if n_components == 1 else exclusive & (ordered[:, 1] - ordered[:, 0] >= margin)
-    labels[safe] = supports[safe].argmax(axis=1)
-    return (labels, np.abs(residuals), bin_centres, widths)
-
-
 def _refine_rebuild_sinogram(
-    gs, cf2, weights, y0, shift, pad, filter_name="hann", recon_mask=None
+    gs, cf2, weights, y0, shift, pad, filter_name="hann"
 ):
     gs.prepare_peaks_from_weights(cf2, weights)
     gs.build_sinogram()
     gs.update_recon_parameters(y0=y0, shift=shift, pad=pad)
     # Assign directly: update_recon_parameters(mask=None) preserves the old mask.
-    gs.recon_mask = recon_mask
+    gs.recon_mask = None
     gs.recon(method="iradon", workers=1, filter_name=filter_name)
     gs.recon_mask = np.ones(gs.recons["iradon"].shape, dtype=bool)
     return gs
-
-
-def _decouple_rebuild_split_sinogram(*args, **kwargs):
-    """Compatibility wrapper for reconstruction from fractional peak weights."""
-    return _refine_rebuild_sinogram(*args, **kwargs)
 
 
 def _refine_connected_grain_mask(
     image,
     centre,
     ystep,
-    radius,
     level=0.15,
     dilation=2,
-    geometry=None,
     smoothed_image=None,
+    reference_mask=None,
 ):
-    """Evolve a threshold-seeded Chan-Vese contour in the sample-space ROI.
+    """Evolve a threshold-seeded Chan-Vese contour over the full image.
 
     ``level`` initializes the contour; it is not the final density cutoff.
-    Crop to the fixed ROI so distant reconstruction streaks cannot affect the
-    foreground/background estimates or the cost of level-set evolution.
+    Select the initial core nearest the grain centre and retain all evolved
+    components overlapping it, without a circular cutoff on their extent.
+    A previous support can select all surviving seed components after a neck
+    splits between feedback iterations.
     """
     from skimage.segmentation import morphological_chan_vese
 
-    if geometry is None:
-        geometry = _refine_mask_geometry(image.shape, centre, ystep, radius)
-    roi, distances = geometry
     if smoothed_image is None:
         smoothed_image = gaussian_filter(np.maximum(image, 0), 1)
-    if not roi.any() or smoothed_image[roi].max() <= 0:
-        raise RuntimeError(
-            "No reconstructed core inside ROI; inspect centre and radius"
-        )
+    if smoothed_image.max() <= 0:
+        raise RuntimeError("No reconstructed core; inspect centre and mask_level")
     components, count = ndi_label(
-        roi & (smoothed_image >= level * smoothed_image[roi].max())
+        smoothed_image >= level * smoothed_image.max()
     )
     if count == 0:
         raise RuntimeError("No connected core; lower mask_level")
-    nearest_label = components.flat[
-        np.argmin(np.where(components > 0, distances, np.inf))
-    ]
-    seed = binary_fill_holes(components == nearest_label) & roi
-    ri, rj = np.nonzero(roi)
-    # Include a background pixel around the ROI, including at image boundaries.
-    crop = (slice(ri.min(), ri.max() + 1), slice(rj.min(), rj.max() + 1))
-    local_roi = np.pad(roi[crop], 1, mode="constant")
-    density = np.pad(smoothed_image[crop], 1, mode="constant")
-    density[~local_roi] = 0
+    if reference_mask is None:
+        ri = np.arange(image.shape[0])[:, None]
+        rj = np.arange(image.shape[1])[None, :]
+        sx, sy = recon_to_sample(ri, rj, image.shape, ystep)
+        distances = (sx - centre[0]) ** 2 + (sy - centre[1]) ** 2
+        core_labels = components.flat[
+            np.argmin(np.where(components > 0, distances, np.inf))
+        ]
+    else:
+        core_labels = np.unique(components[reference_mask & (components > 0)])
+        if len(core_labels) == 0:
+            raise RuntimeError("No reconstructed core overlaps the previous grain support")
+    seed = binary_fill_holes(np.isin(components, core_labels))
+    # Include a background pixel around the full image, including its boundaries.
+    density = np.pad(smoothed_image, 1, mode="constant")
     density /= density.max()
 
     def constrain(contour):
-        contour[~local_roi] = 0
+        contour[0, :] = contour[-1, :] = 0
+        contour[:, 0] = contour[:, -1] = 0
 
     contour = morphological_chan_vese(
-        density, 40, init_level_set=np.pad(seed[crop], 1, mode="constant"),
+        density, 40, init_level_set=np.pad(seed, 1, mode="constant"),
         smoothing=1, lambda1=1, lambda2=1, iter_callback=constrain,
     )
-    mask = np.zeros_like(roi)
-    mask[crop] = contour[1:-1, 1:-1] > 0
-    components, count = ndi_label(mask & roi)
+    components, count = ndi_label(contour[1:-1, 1:-1] > 0)
     if count == 0:
-        raise RuntimeError("Chan-Vese segmentation lost the grain core; inspect ROI and mask_level")
-    nearest_label = components.flat[
-        np.argmin(np.where(components > 0, distances, np.inf))
-    ]
-    mask = binary_fill_holes(components == nearest_label)
+        raise RuntimeError("Chan-Vese segmentation lost the grain core; inspect centre and mask_level")
+    # Curvature smoothing can split a narrow neck in the selected grain.
+    # Keep every evolved component overlapping its original connected seed,
+    # rather than discarding lobes that no longer reach the grain centre.
+    seed_labels = np.unique(components[seed & (components > 0)])
+    if len(seed_labels) == 0:
+        raise RuntimeError("Chan-Vese segmentation lost the grain core; inspect mask_level")
+    mask = binary_fill_holes(np.isin(components, seed_labels))
     if dilation:
         mask = binary_dilation(mask, iterations=dilation)
-    return mask & roi
+    return mask
 
 
 def _refine_project_grain_profile(
@@ -1910,11 +1406,6 @@ def _refine_shared_peak_weights(
         scores, total[:, None], out=np.zeros_like(scores), where=total[:, None] > 0
     )
     return weights, total, calibrated
-
-
-def _decouple_shared_peak_weights(*args, **kwargs):
-    """Compatibility wrapper for the common multi-grain intensity partition."""
-    return _refine_shared_peak_weights(*args, **kwargs)
 
 
 @dataclass
@@ -2194,7 +1685,6 @@ def refine_grain_sinograms(
     hkl_tol=0.05,
     y0=None,
     centres=None,
-    roi_radius=None,
     iterations=10,
     mask_level=0.12,
     dilation=2,
@@ -2238,10 +1728,9 @@ def refine_grain_sinograms(
     Joint peak assignment runs after all grain projections complete. Internal
     reconstruction workers stay at one. workers=1 keeps serial execution.
 
-    Intermediate backprojections use each fixed grain ROI plus the halo needed
-    for Gaussian smoothing. The final reconstruction covers the full image.
-    Sample-space supports use morphological Chan-Vese segmentation within each
-    fixed ROI (40 evolution steps, one smoothing step, equal region weights).
+    Backprojections and sample-space segmentation cover the full image, without
+    circular ROI clipping. Supports use morphological Chan-Vese segmentation
+    (40 evolution steps, one smoothing step, equal region weights).
     mask_level seeds the contour; dilation is applied after segmentation.
 
     Normal mode uses original cf_4d peaks, their grain_id labels (or best HKL
@@ -2251,22 +1740,19 @@ def refine_grain_sinograms(
     candidates; peaks owned by unselected grains are excluded. At least twenty
     contributing 2D peaks per grain are required; grain_ids can restrict the
     operation to grains with sufficient data.
-    initial_results can supply in-memory decoupling/refinement results as seeds,
-    allowing joint refinement immediately after splitting, before any export.
+    initial_results can supply in-memory refinement results as seeds before export.
 
     Without supplied centres, saved/current translations are used when present;
     otherwise a robust single trajectory is fitted to assigned 4D peaks.
     With y0=None, individual estimates are reduced to one common median scan
     axis and missing positions are refitted using that fixed axis. Supplied
     positions are retained. Explicit y0 may be scalar or one value per selected
-    grain; a scalar sets the common calibrated scan axis. roi_radius is likewise
-    scalar or per grain; its default comes from seed trajectory widths.
+    grain; a scalar sets the common calibrated scan axis.
 
     Seeded mode accepts an original cf_2d with source_2d_row provenance and an
     (n_peaks, n_grains) initial_weights matrix. centres and y0 must be supplied.
-    compatibility can further restrict allowed contributions. Spatial splits
-    and twins use this mode after their specialized initialization, then share
-    this exact refinement loop. intensity_budget optionally limits each peak's
+    compatibility can further restrict allowed contributions.
+    intensity_budget optionally limits each peak's
     available fraction in seeded mode. Saved contributions of unselected grains
     are always reserved in normal mode. This routine requires full, uniform dty
     scans.
@@ -2455,11 +1941,6 @@ def refine_grain_sinograms(
         total = weights.sum(axis=1)
         np.divide(weights, total[:, None], out=weights, where=total[:, None] > 0)
         weights *= budget[:, None]
-        radii = (
-            np.empty(n, dtype=float)
-            if roi_radius is None
-            else np.broadcast_to(np.asarray(roi_radius, dtype=float), (n,)).copy()
-        )
         for k in range(n):
             seeded = weights[:, k] > 0
             if seeded.sum() < 20:
@@ -2468,28 +1949,8 @@ def refine_grain_sinograms(
                         ids[k], int(seeded.sum())
                     )
                 )
-            if roi_radius is None:
-                prediction = _refine_design(cf2.omega[seeded]) @ centres[k] + y0s[k]
-                radii[k] = max(
-                    6 * step,
-                    1.5 * np.percentile(np.abs(cf2.dty[seeded] - prediction), 90),
-                )
-        if not np.isfinite(radii).all() or np.any(radii <= 0):
-            raise ValueError("ROI radii must be positive and finite")
         geometry = [sino_shift_and_pad(yy, len(bins), bins.min(), step) for yy in y0s]
         pad = max(gpad for _, gpad in geometry)
-        shape = (len(bins) + pad, len(bins) + pad)
-        mask_geometry = [
-            _refine_mask_geometry(shape, centres[k], step, radii[k]) for k in range(n)
-        ]
-        reconstruction_masks = [
-            (
-                _refine_reconstruction_mask(roi, geometry[k][0], len(bins))
-                if iterations
-                else None
-            )
-            for k, (roi, _) in enumerate(mask_geometry)
-        ]
         progress.update(1)
         seed_stats = _refine_peak_statistics(weights, cf2.sum_intensity, budget)
         seed_active = weights.sum(axis=1) > 0
@@ -2534,13 +1995,11 @@ def refine_grain_sinograms(
             labels, groups = reflection_cache[key]
             reflection_ids.append(labels)
             reflection_groups.append(groups)
-        final_iteration = False
 
         def rebuild(k):
             return _refine_rebuild_sinogram(
                 sinos[k], cf2, weights[:, k], y0s[k], geometry[k][0], pad,
                 filter_name,
-                recon_mask=None if final_iteration else reconstruction_masks[k],
             )
 
         for gs in grain_map(rebuild, range(n)):
@@ -2548,6 +2007,7 @@ def refine_grain_sinograms(
         reflection_ids = np.column_stack(reflection_ids)
         angle_groups = _refine_group_rows(cf2.omega)
         history, converged = [], False
+        previous_masks = [None] * n
         for iteration in range(iterations):
             iteration_started = perf_counter()
             progress.set_description("Iteration {}: projection".format(iteration + 1))
@@ -2560,12 +2020,12 @@ def refine_grain_sinograms(
                     gs.recons["iradon"],
                     centres[k],
                     step,
-                    radii[k],
                     mask_level,
                     dilation,
-                    mask_geometry[k],
                     smoothed[k],
+                    reference_mask=previous_masks[k],
                 )
+                previous_masks[k] = mask
                 mask_pixels.append(int(mask.sum()))
                 masks.append(mask)
 
@@ -2611,11 +2071,11 @@ def refine_grain_sinograms(
             active = supports.any(axis=1) | (weights.sum(axis=1) > 0)
             if not active.any():
                 raise ValueError(
-                    "Feedback rejected all peaks; inspect ROI and mask_level"
+                    "Feedback rejected all peaks; inspect centre and mask_level"
                 )
             change = np.abs(new_weights - weights)
-            # Keep the original decoupling tolerance in units of a single
-            # fractional assignment, rather than summing changes over grains.
+            # Measure changes per fractional assignment, rather than summing
+            # changes over grains.
             delta, maximum = float(change[active].mean()), float(change.max())
             old_owners = weights.argmax(axis=1)
             iteration_stats = _refine_peak_statistics(
@@ -2637,7 +2097,7 @@ def refine_grain_sinograms(
             counts = iteration_stats["counts"]
             if min(counts) < 20:
                 raise ValueError(
-                    "Grain {} retained fewer than 20 peaks; inspect its ROI and mask_level".format(
+                    "Grain {} retained fewer than 20 peaks; inspect its centre and mask_level".format(
                         ids[int(np.argmin(counts))]
                     )
                 )
@@ -2657,7 +2117,6 @@ def refine_grain_sinograms(
                 "Iteration {}: reconstruction".format(iteration + 1)
             )
             stable = delta < weight_tolerance and maximum < 5 * weight_tolerance
-            final_iteration = stable or iteration + 1 == iterations
             for gs in grain_map(rebuild, range(n)):
                 progress.update(1)
             if not np.allclose(
@@ -2719,10 +2178,9 @@ def refine_grain_sinograms(
                 gs.recons["iradon"],
                 centres[k],
                 step,
-                radii[k],
                 mask_level,
                 dilation,
-                mask_geometry[k],
+                reference_mask=previous_masks[k],
             )
             updated[ids[k]] = gs.grain
             progress.update(1)
@@ -2793,30 +2251,6 @@ def refine_grain_sinograms(
         return updated, result
 
 
-@dataclass
-class GrainDecouplingResult:
-    """Initial grains, reconstructed shapes and conserved 2D intensity fractions.
-
-    ``source_2d_rows`` indexes ``ds.pk2d``. ``peak_weights[:, k]`` is the
-    fraction assigned to child k; zero-sum rows are outside all supports.
-    UBIs are initial copies, not separately refined orientations. Shared
-    contributions are model estimates, not independently measured intensities.
-    """
-
-    grainsinos: list
-    centres: np.ndarray
-    y0: float
-    source_2d_rows: np.ndarray
-    peak_weights: np.ndarray
-    selected_4d_rows: np.ndarray
-    labels4d: np.ndarray
-    history: list
-    converged: bool
-    parent_ids: tuple = ()
-    child_ids: tuple = ()
-    stats: dict = field(default_factory=dict)
-
-
 def _refine_colfile_from_rows(ds, rows, parameters):
     rows = np.asarray(rows, dtype=np.int64)
     if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= len(ds.pk2d["omega"])):
@@ -2855,7 +2289,7 @@ def _validate_peak_assignment(ds, rows, fractions):
     return integer_rows, fractions
 
 
-def _saved_split_assignment(gs, grain_label, phase_name):
+def _saved_peak_assignment(gs, grain_label, phase_name):
     if gs.source_2d_rows is not None:
         return _validate_peak_assignment(gs.ds, gs.source_2d_rows, gs.peak_fractions)
     filename = getattr(gs.ds, "grainsfile", None)
@@ -2935,411 +2369,8 @@ def _refine_errors(grains, cf, rows=None):
     return np.column_stack(errors)
 
 
-def _decouple_fit_twins(omega, dty, compatible, width, y0):
-    exclusive = compatible.sum(axis=1) == 1
-    labels = compatible.argmax(axis=1)
-    X = _refine_design(omega)
-    columns = 4 if y0 is not None else 5
-    A = np.zeros((int(exclusive.sum()), columns))
-    choices = labels[exclusive]
-    for k in (0, 1):
-        if np.sum(exclusive & (labels == k)) < 8:
-            raise ValueError(
-                "Each twin needs at least eight orientation-exclusive 4D peaks"
-            )
-        A[choices == k, 2 * k : 2 * k + 2] = X[exclusive][choices == k]
-    if y0 is None:
-        A[:, 4] = 1
-    if np.linalg.matrix_rank(A) < columns:
-        raise ValueError(
-            "Insufficient twin-exclusive angular coverage; supply calibrated y0"
-        )
-    target = dty[exclusive] - (y0 if y0 is not None else 0)
-    initial = np.linalg.lstsq(A, target, rcond=None)[0]
-    fit = least_squares(
-        lambda p: A @ p - target, initial, loss="soft_l1", f_scale=width
-    )
-    return fit.x[:4].reshape(2, 2), float(y0 if y0 is not None else fit.x[4])
-
-
-def _decouple_eligible_4d(grains, cf_4d, hkl_tol, peak_mask=None):
-    """Keep finite, compatible merged peaks in their original row order."""
-    if peak_mask is not None:
-        peak_mask = np.asarray(peak_mask, dtype=bool)
-        if peak_mask.shape != (cf_4d.nrows,):
-            raise ValueError("peak_mask must contain one value per 4D peak")
-    if peak_mask is None or np.all(peak_mask):
-        errors = _refine_errors(grains, cf_4d)
-        compatible = errors < hkl_tol
-        finite_errors = np.isfinite(errors).all(axis=1)
-    else:
-        rows = np.flatnonzero(peak_mask)
-        if len(rows) < 20:
-            raise ValueError("Too few compatible 4D peaks to decouple")
-        errors = _refine_errors(grains, cf_4d, rows=rows)
-        compatible = np.zeros((cf_4d.nrows, len(grains)), dtype=bool)
-        compatible[rows] = (errors < hkl_tol) & np.isfinite(errors).all(axis=1)[:, None]
-        finite_errors = peak_mask
-    eligible = (np.isfinite(cf_4d.omega) & np.isfinite(cf_4d.dty)
-                & finite_errors & compatible.any(axis=1))
-    selected = np.flatnonzero(eligible)
-    if len(selected) < 20:
-        raise ValueError("Too few compatible 4D peaks to decouple")
-    return selected, compatible
-
-
-def _decouple_threshold_components(image, count, step, level, dilation,
-                                   keep_largest=False, diagnostics=None):
-    """Segment thresholded cores, optionally retaining the largest count by area."""
-    smooth = gaussian_filter(np.maximum(image, 0), 1)
-    if not np.isfinite(smooth).all() or smooth.max() <= 0:
-        raise RuntimeError("Parent reconstruction has no finite positive density")
-    components, found = ndi_label(smooth >= level * smooth.max())
-    if found == 0 or (found > count and not keep_largest):
-        raise RuntimeError(
-            "Spatial threshold found {} disconnected blobs; expected {}. "
-            "Inspect the parent reconstruction and mask_level; no blobs were "
-            "discarded, merged or split.".format(found, count))
-    areas = np.bincount(components.ravel(), minlength=found + 1)[1:]
-    density = np.bincount(components.ravel(), weights=smooth.ravel(), minlength=found + 1)[1:]
-    region_ids = np.arange(1, found + 1)
-    ranking = np.lexsort((region_ids, -areas))
-    selected = region_ids[ranking[:count]]
-    excluded = region_ids[ranking[count:]]
-    if diagnostics is not None:
-        diagnostics.update(
-            expected=count, found=found, mask_level=level,
-            selection="largest pixel area" if keep_largest else "exact count",
-            selected_region_ids=selected.tolist(), excluded_region_ids=excluded.tolist(),
-            excluded_pixels=int(areas[excluded - 1].sum()),
-            excluded_density=float(density[excluded - 1].sum()),
-            thresholded_density=float(density.sum()),
-            regions=[dict(region_id=int(region_ids[k]), pixels=int(areas[k]),
-                          density_sum=float(density[k]), selected=bool(region_ids[k] in selected))
-                     for k in ranking],
-            image=smooth, labels=components)
-    centres, masks, radii = [], [], []
-    for label_id in selected:
-        core = components == label_id
-        ri, rj = np.nonzero(core)
-        sx, sy = recon_to_sample(ri, rj, image.shape, step)
-        mass = smooth[core]
-        centre = np.array([np.average(sx, weights=mass), np.average(sy, weights=mass)])
-        mask = binary_fill_holes(core)
-        if dilation:
-            mask = binary_dilation(mask, iterations=dilation)
-        ri, rj = np.nonzero(mask)
-        sx, sy = recon_to_sample(ri, rj, image.shape, step)
-        # Include the full thresholded/dilated region and one pixel of margin.
-        radius = np.sqrt(((sx - centre[0]) ** 2 + (sy - centre[1]) ** 2).max()) + step
-        centres.append(centre)
-        masks.append(mask)
-        radii.append(radius)
-    centres = np.asarray(centres)
-    order = np.lexsort((centres[:, 1], centres[:, 0]))
-    if diagnostics is not None:
-        diagnostics["selected_region_ids"] = selected[order].tolist()
-    return (centres[order], [masks[k] for k in order],
-            np.asarray(radii)[order], smooth)
-
-
-def _decouple_spatial_initialization(ds, grain, cf2, count, y0, mask_level,
-                                     dilation, support_level, beam_sigma_steps,
-                                     filter_name, minimum_exclusive,
-                                     keep_largest=True, diagnostics=None):
-    """Reconstruct once, segment disconnected blobs and project their supports."""
-    parent = GrainSinogram(copy.deepcopy(grain), ds)
-    shift, pad = sino_shift_and_pad(y0, len(ds.ybincens), min(ds.ybincens), ds.ystep)
-    _refine_rebuild_sinogram(parent, cf2, np.ones(cf2.nrows), y0, shift, pad, filter_name)
-    centres, masks, radii, smooth = _decouple_threshold_components(
-        parent.recons["iradon"], count, float(ds.ystep), mask_level, dilation,
-        keep_largest=keep_largest, diagnostics=diagnostics)
-    count = len(centres)
-    profiles = np.empty((cf2.nrows, count))
-    supports = np.empty((cf2.nrows, count), dtype=bool)
-    angle_groups = _refine_group_rows(cf2.omega)
-    for k, mask in enumerate(masks):
-        profiles[:, k], supports[:, k] = _refine_project_grain_profile(
-            mask, parent.recons["iradon"], cf2.omega, cf2.dty, y0, ds.ystep,
-            support_level, beam_sigma_steps, angle_groups, smooth)
-    gv = np.column_stack((cf2.gx, cf2.gy, cf2.gz))
-    hkl = np.rint(np.dot(gv, grain.ubi.T)).astype(int)
-    _, reflection_ids = np.unique(
-        np.column_stack((hkl, np.sign(cf2.eta))), axis=0, return_inverse=True)
-    groups = _refine_group_rows(reflection_ids)
-    weights, _, _ = _refine_shared_peak_weights(
-        profiles, supports, cf2.sum_intensity, reflection_ids,
-        minimum_exclusive, [groups] * count)
-    if np.any((weights > 0).sum(axis=0) < 20):
-        raise RuntimeError("A thresholded blob has fewer than 20 projected seed peaks")
-    return centres, weights, radii
-
-
-def split_grain_sinogram(
-    ds,
-    grain,
-    cf_4d,
-    twin_grain=None,
-    hkl_tol=0.05,
-    y0=None,
-    width=None,
-    width_2d=None,
-    margin=None,
-    angle_bin=10,
-    density_fraction=0.08,
-    trials=600,
-    seed=42,
-    iterations=10,
-    mask_level=0.12,
-    dilation=2,
-    roi_radius=None,
-    support_level=0.02,
-    beam_sigma_steps=0.75,
-    damping=0.5,
-    weight_tolerance=0.005,
-    filter_name="hann",
-    minimum_exclusive=5,
-    verbose=True,
-    peak_mask=None,
-    n_components=2,
-    max_components=4,
-    _initial_fit=None,
-    ransac_confidence=0.999,
-    initialization="spatial",
-    spatial_keep_largest=True,
-    workers=None,
-):
-    """Decouple one mixed orientation, or two known twin-related orientations.
-
-    Single orientation: reconstruct the parent's peaks and threshold disconnected
-    blobs to initialize the requested count (default two). Project these masks to
-    select seed peaks, then refine by back/forward projection. This default path
-    fits no sinusoids and requires calibrated y0 or ds.y0. When extra blobs are
-    present, spatial_keep_largest=True retains the requested count by pixel area
-    and reports exclusions. False rejects extra blobs. If fewer blobs are found,
-    use the detected count, including a single blob.
-
-    initialization="trajectory" explicitly enables the separate sinusoid-based
-    initializer, with n_components=None opting into automatic count estimation.
-    initialization="hough" seeds those fits by deterministic, angularly balanced
-    Hough voting in sample space. It requires calibrated y0 or ds.y0; trials,
-    seed and ransac_confidence do not control Hough voting.
-
-    With ``twin_grain``, preserve the two distinct UBIs. Reflections compatible
-    with only one UBI seed its shape; only peaks compatible with both can be
-    shared. This also permits co-centred twins provided exclusive reflections
-    resolve their shapes. The twin law/second orientation is NOT inferred.
-    Both initializers delegate reconstruction and projection feedback to
-    refine_grain_sinograms(), including its workers setting (None uses all
-    available cores, capped at the number of components).
-
-    Uses full, uniformly increasing dty scans. No files or input grains are
-    changed. Returned shapes/UBIs require inspection and separate refinement.
-    ``peak_mask`` restricts rows before HKL scoring, retaining original indices.
-    ``ransac_confidence`` applies only to RANSAC automatic count estimation.
-    Trajectory initialization with a fixed count uses the original full-trial solver.
-    """
-    if initialization not in ("spatial", "trajectory", "hough"):
-        raise ValueError("initialization must be 'spatial', 'trajectory' or 'hough'")
-    spatial = twin_grain is None and initialization == "spatial"
-    hough = twin_grain is None and initialization == "hough"
-    fit_options = dict(hough=True) if hough else {}
-    if hough:
-        y0 = y0 if y0 is not None else getattr(ds, "y0", None)
-        if y0 is None or not np.isfinite(y0):
-            raise ValueError("Hough initialization needs calibrated y0 or ds.y0")
-    if spatial and n_components is None:
-        raise ValueError("Spatial initialization requires an explicit expected component count")
-    if ransac_confidence is not None and not 0 < ransac_confidence < 1:
-        raise ValueError("RANSAC confidence must be between zero and one, or None")
-    if n_components is not None and (isinstance(n_components, (bool, np.bool_))
-            or not isinstance(n_components, (int, np.integer)) or not 2 <= n_components <= 4):
-        raise ValueError("n_components must be an integer from two to four")
-    if twin_grain is not None and n_components not in (None, 2):
-        raise ValueError("Twin pairs require exactly two components")
-    step = float(ds.ystep)
-    bins = np.asarray(ds.ybincens)
-    if step <= 0 or len(bins) < 2 or not np.allclose(np.diff(bins), step):
-        raise ValueError("Decoupling requires a uniform increasing dty grid")
-    width = float(2 * step if width is None else width)
-    margin = float(step if margin is None else margin)
-    if (
-        hkl_tol <= 0
-        or width <= 0
-        or margin < 0
-        or iterations < 0
-        or not 0 < damping <= 1
-        or not 0 < mask_level < 1
-        or weight_tolerance <= 0
-        or minimum_exclusive < 1
-        or dilation < 0
-    ):
-        raise ValueError("Invalid decoupling controls")
-    originals = [grain] if twin_grain is None else [grain, twin_grain]
-    selected, compatible4d = _decouple_eligible_4d(
-        originals, cf_4d, hkl_tol, peak_mask)
-    omega, dty = cf_4d.omega[selected], cf_4d.dty[selected]
-    selection = None
-    if spatial:
-        fitted_y0 = y0 if y0 is not None else getattr(ds, "y0", None)
-        if fitted_y0 is None or not np.isfinite(fitted_y0):
-            raise ValueError("Spatial initialization needs calibrated y0 or ds.y0; no sinusoid is fitted")
-        fitted_y0 = float(fitted_y0)
-        labels4d = np.full(len(selected), -1, dtype=int)
-        originals = [grain] * n_components
-    elif twin_grain is None:
-        if n_components is None:
-            initial = (_decouple_auto_components(
-                omega, dty, width, margin, y0, trials, seed, max_components, ransac_confidence, **fit_options)
-                if _initial_fit is None else _initial_fit)
-            centres, fitted_y0, labels4d, selection = initial
-            n_components = len(centres)
-            if verbose:
-                print("Detected {} spatial component(s); scores: {}{}".format(
-                    n_components, dict(zip(selection["counts"], selection.get("selection_scores", selection["scores"]))),
-                    " (ambiguous)" if selection["ambiguous"] else ""))
-            if selection["reached_limit"]:
-                warnings.warn("Automatic count reached max_components; inspect tracks or increase the limit", RuntimeWarning)
-        # Automatic detection chooses the count; refit using the selected
-        # trajectory initializer before learning full branch envelopes.
-        if n_components > 1:
-            centres, fitted_y0, labels4d = _decouple_fit_components(
-                omega, dty, width, margin, y0, trials, seed, n_components,
-                confidence=None, **fit_options)
-        originals = [grain] * n_components
-    else:
-        n_components = 2
-        centres, fitted_y0 = _decouple_fit_twins(
-            omega, dty, compatible4d[selected], width, y0
-        )
-        labels4d = np.full(len(selected), -2, dtype=int)
-        exclusive = compatible4d[selected].sum(axis=1) == 1
-        labels4d[exclusive] = compatible4d[selected][exclusive].argmax(axis=1)
-    # np.isin handles partial/unsorted 4D tables without the mapping kernel's bounds assumptions.
-    rows = np.flatnonzero(np.isin(ds.pk2d["spot3d_id"], cf_4d.spot3d_id[selected]))
-    cf2 = _refine_colfile_from_rows(ds, rows, cf_4d.parameters)
-    errors2d = _refine_errors(originals, cf2)
-    compatible2d = errors2d < hkl_tol
-    yindices = np.rint((cf2.dty - bins[0]) / step)
-    valid2d = (
-        np.isfinite(errors2d).all(axis=1)
-        & np.isfinite(cf2.omega)
-        & np.isfinite(cf2.dty)
-        & np.isfinite(cf2.eta)
-        & np.isfinite(cf2.sum_intensity)
-        & (cf2.sum_intensity > 0)
-        & (yindices >= 0)
-        & (yindices < len(bins))
-        & compatible2d.any(axis=1)
-    )
-    cf2.filter(valid2d)
-    compatible2d = compatible2d[valid2d]
-    if cf2.nrows < 20 * (1 if spatial else n_components):
-        raise ValueError("Too few valid compatible 2D peaks to decouple")
-    spatial_diagnostics = {}
-    if spatial:
-        centres, weights, spatial_radii = _decouple_spatial_initialization(
-            ds, grain, cf2, n_components, fitted_y0, mask_level, dilation,
-            support_level, beam_sigma_steps, filter_name, minimum_exclusive,
-            keep_largest=spatial_keep_largest, diagnostics=spatial_diagnostics)
-        n_components = len(centres)
-        originals = [grain] * n_components
-        compatible2d = compatible2d[:, :n_components]
-        if verbose and spatial_diagnostics:
-            print("Spatial initialization kept {} of {} regions; excluded {} regions ({} pixels).".format(
-                n_components, spatial_diagnostics["found"],
-                len(spatial_diagnostics["excluded_region_ids"]), spatial_diagnostics["excluded_pixels"]))
-    elif twin_grain is None:
-        labels, _, _, envelopes = _decouple_select_full_branches(
-            cf2.omega,
-            cf2.dty,
-            centres,
-            fitted_y0,
-            step,
-            width,
-            margin,
-            width_2d,
-            angle_bin,
-            density_fraction,
-        )
-        size = np.percentile(envelopes, 90, axis=(0, 2))
-    else:
-        labels = np.full(cf2.nrows, -1, dtype=int)
-        exclusive = compatible2d.sum(axis=1) == 1
-        labels[exclusive] = compatible2d[exclusive].argmax(axis=1)
-        residual = np.abs(
-            cf2.dty[:, None] - _refine_predict(cf2.omega, centres, fitted_y0)
-        )
-        if any(np.sum(labels == k) < 20 for k in range(n_components)):
-            raise ValueError(
-                "Each twin needs enough exclusive 2D peaks to seed its reconstruction"
-            )
-        size = np.array([np.percentile(residual[labels == k, k], 90) for k in range(n_components)])
-    if not spatial:
-        weights = np.column_stack([labels == k for k in range(n_components)]).astype(float)
-    radii = (
-        (spatial_radii if spatial else np.maximum(6 * step, 1.5 * size))
-        if roi_radius is None
-        else np.broadcast_to(np.asarray(roi_radius, float), (n_components,)).copy()
-    )
-    if not np.isfinite(radii).all() or np.any(radii <= 0):
-        raise ValueError("ROI radii must be positive and finite")
-    seeds = []
-    for k, original in enumerate(originals):
-        child = copy.deepcopy(original)
-        child.name = "{}_split_{}".format(getattr(original, "name", "grain"), k)
-        if hasattr(child, "intensity_info"):
-            del child.intensity_info
-        seeds.append(child)
-    _, refined = refine_grain_sinograms(
-        ds,
-        seeds,
-        cf_2d=cf2,
-        initial_weights=weights,
-        compatibility=compatible2d,
-        centres=centres,
-        y0=fitted_y0,
-        roi_radius=radii,
-        hkl_tol=hkl_tol,
-        iterations=iterations,
-        mask_level=mask_level,
-        dilation=dilation,
-        support_level=support_level,
-        beam_sigma_steps=beam_sigma_steps,
-        damping=damping,
-        weight_tolerance=weight_tolerance,
-        filter_name=filter_name,
-        minimum_exclusive=minimum_exclusive,
-        verbose=verbose,
-        use_saved_assignments=False,
-        workers=workers,
-    )
-    for gs in refined.grainsinos:
-        gs.peak_assignment_kind = "split"
-    refined.stats["initialization"] = "spatial_threshold" if spatial else ("hough" if hough else "trajectory")
-    if selection is not None:
-        refined.stats["component_selection"] = selection
-    result = GrainDecouplingResult(
-        refined.grainsinos,
-        refined.centres,
-        fitted_y0,
-        refined.source_2d_rows,
-        refined.peak_weights,
-        selected,
-        labels4d,
-        refined.history,
-        refined.converged,
-        stats=refined.stats,
-    )
-    if spatial:
-        result.spatial_component_diagnostics = spatial_diagnostics
-        result.stats["spatial_components"] = {
-            key: value for key, value in spatial_diagnostics.items() if key not in ("image", "labels")}
-    return result
-
-
 def _refine_peak_owners(grains, cf_4d, cf_strong, hkl_tol):
-    """Assign each merged peak to one parent before independent splits.
+    """Assign each merged peak to one parent for refinement.
 
     Existing 4D assignments are used when available. Otherwise score against
     all original grains. Strong-subset assignments override those labels.
@@ -3364,213 +2395,6 @@ def _refine_peak_owners(grains, cf_4d, cf_strong, hkl_tol):
         indices = order[np.searchsorted(spot_ids, cf_4d.spot3d_id[matched])]
         owners[matched] = cf_strong.grain_id[indices].astype(np.int64)
     return owners
-
-
-# Compatibility names for the earlier decoupling-specific helpers.
-_decouple_group_rows = _refine_group_rows
-_decouple_project_kernel = _refine_project_kernel
-_decouple_mask_geometry = _refine_mask_geometry
-_decouple_design = _refine_design
-_decouple_predict = _refine_predict
-_decouple_connected_grain_mask = _refine_connected_grain_mask
-_decouple_project_grain_profile = _refine_project_grain_profile
-_decouple_colfile_from_rows = _refine_colfile_from_rows
-_decouple_errors = _refine_errors
-_decouple_peak_owners = _refine_peak_owners
-
-
-def decouple_grain_sinograms(
-    ds, grains, cf_4d, grain_ids=(), twin_pairs=(), cf_strong=None, report=None, **kwargs
-):
-    """Return updated grains and results for selected IDs/pairs or batch screening.
-
-    The default spatial mode requires explicit expected counts. With
-    initialization="trajectory" or "hough", grain_ids=None screens all parents except known twin pairs. Only
-    unambiguous multi-track parents below the search limit are reconstructed.
-    Single-track, uncertain and failed parents retain their original objects.
-    An optional report list receives one status dictionary per processed entry.
-    Per-parent ValueError/RuntimeError failures are reported and skipped in batch
-    mode; explicit selections retain fail-fast behavior. Global intensity
-    conflicts still raise. Return shapes are unchanged.
-
-    grain_ids accepts a list (two manual components per parent) or a mapping such as
-    {0: 3, 2: 4} giving the child count per parent. IDs are original list
-    positions. Child 0 retains its parent ID; other children are appended. Twin pairs retain both indices
-    and both original UBIs. Inputs are unchanged; entries must be disjoint.
-    Each entry considers peaks owned by its parent IDs and compatible
-    unassigned peaks, so incomplete indexing cannot remove a spatial branch.
-    Peaks assigned to other parents are excluded. Ownership comes from
-    cf_4d.grain_id, or the best HKL match among all original grains if absent;
-    cf_strong.grain_id takes precedence for its subset. Twin pairs jointly
-    partition the union of both parents' peaks.
-
-    If ``cf_strong`` is supplied, return a third value: an updated merged
-    4D plotting columnfile restricted to the original strong subset.
-    Untouched rows are preserved. Split rows are remerged from weighted 2D
-    contributions, once per contributing child. Repeated spot3d_id values
-    identify shared parent peaks; use this table for plotting, not indexing.
-    Keep the original cf_strong for reruns; the returned table must not be
-    fed back as an input alongside the original parents.
-    """
-    for name, cf in (("cf_4d", cf_4d), ("cf_strong", cf_strong)):
-        if cf is not None and any(
-            title in cf.titles
-            for title in ("source_4d_row", "source_2d_row", "split_fraction")
-        ):
-            raise ValueError(
-                "{} contains decoupled plotting contributions. Rerun with the "
-                "original peak table and grains_before_decoupling; keep the "
-                "original strong table as cf_strong_before_decoupling and store "
-                "the third return value as cf_strong_decoupled.".format(name)
-            )
-    confidence = kwargs.get("ransac_confidence", 0.999)
-    if confidence is not None and not 0 < confidence < 1:
-        raise ValueError("RANSAC confidence must be between zero and one, or None")
-    batch = grain_ids is None
-    if batch and kwargs.get("initialization", "spatial") not in ("trajectory", "hough"):
-        raise ValueError("Spatial decoupling requires manual expected counts; automatic sinusoid screening requires initialization='trajectory' or 'hough'")
-    if batch and report is None:
-        report = []
-    pairs = [tuple(pair) for pair in twin_pairs]
-    if any(len(pair) != 2 for pair in pairs):
-        raise ValueError("Each twin pair must contain two existing grain IDs")
-    paired = {gid for pair in pairs for gid in pair}
-    ids = [gid for gid in range(len(grains)) if gid not in paired] if batch else list(grain_ids)
-    component_counts = dict(grain_ids) if hasattr(grain_ids, "items") else dict.fromkeys(ids, None if batch else 2)
-    if any(count is not None and (isinstance(count, (bool, np.bool_))
-           or not isinstance(count, (int, np.integer)) or not 2 <= count <= 4)
-           for count in component_counts.values()):
-        raise ValueError("Component counts must be integers from two to four")
-    entries = ids + [gid for pair in pairs for gid in pair]
-    if any(
-        not isinstance(gid, (int, np.integer))
-        or isinstance(gid, bool)
-        or gid < 0
-        or gid >= len(grains)
-        for gid in entries
-    ) or len(set(entries)) != len(entries):
-        raise ValueError(
-            "Grain IDs must be valid, unique, and disjoint from twin pairs"
-        )
-    updated = list(grains)
-    results = []
-    owners = (
-        _refine_peak_owners(grains, cf_4d, cf_strong, kwargs.get("hkl_tol", 0.05))
-        if entries
-        else None
-    )
-    work = [(gid,) for gid in ids] + pairs
-    if batch:
-        work = tqdm(work, desc="Screening grain sinograms", disable=not kwargs.get("verbose", True))
-    for entry in work:
-        record = dict(parent_ids=entry, child_ids=entry, n_components=None,
-                      status=None, component_selection=None, error=None)
-        peak_mask = np.isin(owners, entry) | (owners < 0)
-        split_options = dict(kwargs)
-        try:
-            if batch and len(entry) == 1:
-                selected, _ = _decouple_eligible_4d(
-                    [grains[entry[0]]], cf_4d, kwargs.get("hkl_tol", 0.05), peak_mask)
-                width = kwargs.get("width")
-                margin = kwargs.get("margin")
-                hough = kwargs.get("initialization") == "hough"
-                axis = kwargs.get("y0")
-                if hough and axis is None:
-                    axis = getattr(ds, "y0", None)
-                fit_options = dict(hough=True) if hough else {}
-                initial = _decouple_auto_components(
-                    cf_4d.omega[selected], cf_4d.dty[selected],
-                    2 * float(ds.ystep) if width is None else float(width),
-                    float(ds.ystep) if margin is None else float(margin),
-                    axis, kwargs.get("trials", 600),
-                    kwargs.get("seed", 42), kwargs.get("max_components", 4),
-                    kwargs.get("ransac_confidence", 0.999), **fit_options)
-                selection = initial[3]
-                record.update(n_components=len(initial[0]), component_selection=selection)
-                if selection["ambiguous"] or selection["reached_limit"]:
-                    record["status"] = "review"
-                elif len(initial[0]) == 1:
-                    record["status"] = "unchanged"
-                if record["status"] is not None:
-                    if report is not None:
-                        report.append(record)
-                    continue
-                split_options["_initial_fit"] = initial
-            result = split_grain_sinogram(
-                ds,
-                grains[entry[0]],
-                cf_4d,
-                twin_grain=grains[entry[1]] if len(entry) == 2 else None,
-                peak_mask=peak_mask,
-                n_components=component_counts[entry[0]] if len(entry) == 1 else 2,
-                **split_options
-            )
-        except (ValueError, RuntimeError) as exc:
-            if not batch:
-                raise type(exc)("Decoupling parent IDs {}: {}".format(entry, exc)) from exc
-            record.update(status="failed", error=str(exc))
-            if report is not None:
-                report.append(record)
-            if kwargs.get("verbose", True):
-                tqdm.write("Decoupling parent IDs {} failed: {}".format(entry, exc))
-            continue
-        targets = ((entry[0],) + tuple(range(len(updated), len(updated) + len(result.grainsinos) - 1))
-                   if len(entry) == 1 else entry)
-        result.parent_ids, result.child_ids = entry, targets
-        for k, target in enumerate(targets):
-            g = result.grainsinos[k].grain
-            g.gid = target
-            if target == len(updated):
-                updated.append(g)
-            else:
-                updated[target] = g
-        results.append(result)
-        record.update(status="split", n_components=len(result.grainsinos), child_ids=targets)
-        if report is not None:
-            report.append(record)
-    if results:
-        rows = np.concatenate([result.source_2d_rows for result in results])
-        fractions = np.concatenate(
-            [result.peak_weights.sum(axis=1) for result in results]
-        )
-        _, inverse = np.unique(rows, return_inverse=True)
-        overallocated = np.bincount(inverse, weights=fractions) > 1 + 1e-8
-        if np.any(overallocated):
-            conflicting_rows = np.unique(rows)[overallocated]
-            conflicts = []
-            for i, first in enumerate(results):
-                first_rows = first.source_2d_rows[first.peak_weights.sum(axis=1) > 0]
-                for second in results[i + 1 :]:
-                    second_rows = second.source_2d_rows[
-                        second.peak_weights.sum(axis=1) > 0
-                    ]
-                    shared = np.intersect1d(
-                        np.intersect1d(first_rows, second_rows), conflicting_rows
-                    )
-                    if shared.size:
-                        conflicts.append(
-                            "{} and {} ({} rows)".format(
-                                first.parent_ids, second.parent_ids, shared.size
-                            )
-                        )
-            raise ValueError(
-                "Selected decouplings share 2D intensity: {}. "
-                "Use twin_pairs for known, distinct twin orientations and remove "
-                "those IDs from grain_ids; otherwise inspect duplicate orientations "
-                "and hkl_tol. Input grains are unchanged.".format("; ".join(conflicts))
-            )
-    if batch and kwargs.get("verbose", True):
-        print("Decoupling batch: {}".format({
-            status: sum(row["status"] == status for row in report)
-            for status in ("split", "unchanged", "review", "failed")}))
-    if cf_strong is not None:
-        return updated, results, decoupled_strong_columnfile(ds, cf_strong, results)
-    return updated, results
-
-
-def decoupled_strong_columnfile(ds, cf_strong, results):
-    """Compatibility wrapper for merged fractional plotting contributions."""
-    return refined_strong_columnfile(ds, cf_strong, results)
 
 
 def refined_strong_columnfile(ds, cf_strong, results):
@@ -3658,59 +2482,12 @@ def refined_strong_columnfile(ds, cf_strong, results):
     return cf
 
 
-def decoupled_plot_columnfile(ds, cf_strong, results):
-    """Build a 2D plot table for all grains without modifying input peaks.
-
-    ``source_2d_row`` indexes ds.pk2d; ``split_fraction`` records each
-    contribution. ``sum_intensity`` already includes that fraction.
-    """
-    if "grain_id" not in cf_strong.titles:
-        raise ValueError("cf_strong must contain grain_id assignments")
-    spot_ids, order = np.unique(cf_strong.spot3d_id, return_index=True)
-    if len(spot_ids) != cf_strong.nrows:
-        raise ValueError("cf_strong must contain unique spot3d_id values")
-    source_spots = ds.pk2d["spot3d_id"]
-    rows = np.flatnonzero(np.isin(source_spots, spot_ids))
-    grain_ids = cf_strong.grain_id[order[np.searchsorted(spot_ids, source_spots[rows])]]
-    parents = [gid for result in results for gid in result.parent_ids]
-    claimed = [
-        result.source_2d_rows[result.peak_weights.sum(axis=1) > 0] for result in results
-    ]
-    claimed = np.concatenate(claimed) if claimed else np.empty(0, dtype=np.int64)
-    keep = ~np.isin(grain_ids, parents) & ~np.isin(rows, claimed)
-    row_parts = [rows[keep]]
-    id_parts = [grain_ids[keep]]
-    fraction_parts = [np.ones(keep.sum())]
-    for result in results:
-        for k, gid in enumerate(result.child_ids):
-            fractions = result.peak_weights[:, k]
-            used = fractions > 0
-            row_parts.append(result.source_2d_rows[used])
-            id_parts.append(np.full(used.sum(), gid, dtype=np.int64))
-            fraction_parts.append(fractions[used])
-    rows = np.concatenate(row_parts).astype(np.int64)
-    fractions = np.concatenate(fraction_parts)
-    cf = _refine_colfile_from_rows(ds, rows, cf_strong.parameters)
-    cf.addcolumn(np.concatenate(id_parts).astype(np.int64), "grain_id")
-    cf.addcolumn(fractions, "split_fraction")
-    cf.addcolumn(cf.sum_intensity * fractions, "sum_intensity")
-    return cf
-
-
-def plot_decoupled_sinograms(results):
-    """Compatibility wrapper for nbGui.nb_utils.plot_decoupled_sinograms."""
-    from ImageD11.nbGui.nb_utils import plot_decoupled_sinograms
-
-    return plot_decoupled_sinograms(results)
-
-
 def save_refined_grains(ds, grains, result, phase_name=None):
-    """Atomically export a refinement result and fractions for later mapping."""
-    return _save_grain_peak_assignments(ds, grains, [result], phase_name)
+    """Atomically export grains and optional refinement fractions for mapping.
 
-
-def save_decoupled_grains(ds, grains, results, phase_name=None):
-    """Atomically export spatial/twin splits and fractions for later mapping."""
+    Pass result=None to export indexed grains without refinement.
+    """
+    results = [] if result is None else [result]
     return _save_grain_peak_assignments(ds, grains, results, phase_name)
 
 
@@ -3719,7 +2496,7 @@ def _save_grain_peak_assignments(ds, grains, results, phase_name=None):
 
     Replaces this phase's indexed grain group, like a fresh indexing export;
     other phases/groups are preserved. Existing maps of this phase become stale.
-    Fractional provenance allows prepare_peaks_from_4d() to reuse the split.
+    Fractional provenance allows prepare_peaks_from_4d() to reuse the fractions.
     """
     for result in results:
         if len(result.child_ids) != len(result.grainsinos):
@@ -3730,7 +2507,7 @@ def _save_grain_peak_assignments(ds, grains, results, phase_name=None):
     backup = None
     if path.exists():
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        backup = path.with_name(path.name + ".before_decoupling_" + stamp + ".bak")
+        backup = path.with_name(path.name + ".before_refinement_" + stamp + ".bak")
         shutil.copy2(path, backup)
     fd, temporary = tempfile.mkstemp(
         prefix=path.name + ".", suffix=".h5", dir=path.parent
@@ -3782,10 +2559,8 @@ def _save_grain_peak_assignments(ds, grains, results, phase_name=None):
                             "Peak refinement result does not match output grain position"
                         )
                     gs.to_h5py_group(group, str(gid))
-                    kind = gs.peak_assignment_kind or "split"
-                    prefix = "split" if kind == "split" else "refinement"
-                    group[str(gid)].attrs[prefix + "_parent_ids"] = result.parent_ids
-                    group[str(gid)].attrs[prefix + "_converged"] = result.converged
+                    group[str(gid)].attrs["refinement_parent_ids"] = result.parent_ids
+                    group[str(gid)].attrs["refinement_converged"] = result.converged
                     written.add(gid)
             for gid, g in enumerate(grains):
                 if not np.allclose(group[str(gid)]["ubi"][:], g.ubi):
@@ -3811,7 +2586,6 @@ def _save_grain_peak_assignments(ds, grains, results, phase_name=None):
                     )
             tmap_name = "TensorMap_" + phase
             if tmap_name in fout:
-                fout[tmap_name].attrs["requires_reconstruction_after_decoupling"] = True
                 fout[tmap_name].attrs[
                     "requires_reconstruction_after_peak_refinement"
                 ] = True

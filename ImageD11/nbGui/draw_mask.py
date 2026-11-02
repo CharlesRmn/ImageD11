@@ -25,7 +25,7 @@ class InteractiveMask:
     def __init__(self, image):
         self.image = image
         self.polygon_points = None  # Store polygon points
-        self.fig, self.ax = plt.subplots(layout='constrained')
+        self.fig, self.ax = plt.subplots(layout='constrained', figsize=(12, 10))
         self.ax.imshow(image, origin='lower')
         self.selector = PolygonSelector(self.ax, self.on_select)
         

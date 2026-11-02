@@ -134,7 +134,7 @@ def test_notebook_recovery_acceptance_and_disabled_path(monkeypatch):
                cosine_tol=.01, max_grains=10, peak_assign_tol=.05)
     for cell in (picker_cell, index_cell, accept_cell, accept_cell):
         exec(compile(cell, '<notebook>', 'exec'), env)
-    assert len(env['grains_before_decoupling']) == 2
+    assert len(env['grains_before_peak_refinement']) == 2
     np.testing.assert_array_equal(env['grains'][1].translation, np.r_[centre, 0])
     assert env['grains'][0] is original
     monkeypatch.setattr(utils, 'select_hough_grains', lambda *a: ([(0, 0)], []))
@@ -145,13 +145,13 @@ def test_notebook_recovery_acceptance_and_disabled_path(monkeypatch):
     assert env['selected_hough_candidates'] == [0]
     assert env['resolved_hough_width'] == .03
     assert env['selected_hough_grains'] == [(0, 0)]
-    assert len(env['grains_before_decoupling']) == 2
+    assert len(env['grains_before_peak_refinement']) == 2
     env['recover_hough_grains'] = False
     for cell in (picker_cell, index_cell, accept_cell):
         exec(compile(cell, '<notebook>', 'exec'), env)
     assert env['hough_picker'] is None
     assert env['hough_results'] == {}
-    assert env['grains_before_decoupling'] == [original]
+    assert env['grains_before_peak_refinement'] == [original]
 
 
 def test_automatic_acceptance_requires_new_support_and_rejects_duplicates():
@@ -174,3 +174,48 @@ def test_automatic_acceptance_requires_new_support_and_rejects_duplicates():
     result['indexer'].minpks = 4
     choices, report = utils.select_hough_grains([existing], {0: result}, .01)
     assert choices == []
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_notebook_refines_indexed_grains_directly_and_exports(enabled, monkeypatch):
+    import json
+    from pathlib import Path
+    from ImageD11.sinograms import sinogram as sino
+
+    notebook = json.loads((Path(__file__).resolve().parents[1] /
+        'ImageD11/nbGui/S3DXRD/tomo_1_index.ipynb').read_text())
+    cells = [''.join(c.get('source', [])) for c in notebook['cells']
+             if c['cell_type'] == 'code']
+    refine_cell = next(c for c in cells if '# Start from the same grains and original peaks on every parameter trial.' in c)
+    export_cell = next(c for c in cells if c.startswith('backup = save_refined_grains('))
+    original = [grain(np.eye(3))]
+    updated = [grain(np.eye(3), translation=np.array([.1, .2, 0.]))]
+    cf4, strong, ds = object(), object(), SimpleNamespace(save=lambda: None)
+    result = SimpleNamespace(grainsinos=[], converged=True)
+    calls, exports = [], []
+
+    def refine(dataset, grains, peaks, **kwargs):
+        assert dataset is ds and grains is original and peaks is cf4
+        assert kwargs['cf_strong'] is strong
+        assert kwargs['use_saved_assignments'] is False
+        assert 'initial_results' not in kwargs
+        calls.append(kwargs)
+        return updated, result, object()
+
+    def export(dataset, grains, refinement, phase_name):
+        assert dataset is ds and phase_name == 'Fe'
+        exports.append((grains, refinement))
+
+    monkeypatch.setattr(sino, 'refine_grain_sinograms', refine)
+    monkeypatch.setattr(sino, 'save_refined_grains', export)
+    env = dict(grains_before_peak_refinement=original,
+               cf_strong_before_peak_refinement=strong, cf_4d=cf4, ds=ds,
+               refine_all_grain_peaks=enabled, peak_refinement_options={},
+               phase_str='Fe', peak_assign_tol=.05, refinement_report_limit=4,
+               plot_refinement_report=False, plt=SimpleNamespace(show=lambda: None),
+               utils=SimpleNamespace(plot_grainsino_grid=lambda *a: None,
+                                     report_sinogram_refinement=lambda *a, **k: []))
+    exec(compile(refine_cell, '<refinement cell>', 'exec'), env)
+    exec(compile(export_cell, '<export cell>', 'exec'), env)
+    assert len(calls) == int(enabled)
+    assert exports == [(updated, result)] if enabled else exports == [(original, None)]
